@@ -1,0 +1,13 @@
+[project]
+name = "yorum-ayikla"
+version = "0.1.0"
+description = "YouTube ve Ekşi Sözlük yorumlarını çekip Claude ile prompt'a göre ayıklayan web uygulaması"
+requires-python = ">=3.13"
+dependencies = [
+    "anthropic>=1.6.0",
+    "beautifulsoup4>=4.15.0",
+    "curl-cffi>=0.16.3",
+    "pandas>=3.0.5",
+    "streamlit>=1.64.0",
+    "yt-dlp>=2026.8.19",
+]
