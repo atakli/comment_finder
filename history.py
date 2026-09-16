@@ -3,6 +3,7 @@
 Her çalıştırma bir dizin:
 - meta.json — liste için küçük özet (kaynak, linkler, prompt, model, sayılar)
 - data.json — {"fetched": {link: [öğe]}, "results": [öğe] | null, "errors": [str]}
+Silinen kayıtlar data/trash/<id>/ altına taşınır, restore_run ile geri alınabilir.
 """
 import json
 import shutil
@@ -10,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 RUNS_DIR = Path(__file__).parent / "data" / "runs"
+TRASH_DIR = Path(__file__).parent / "data" / "trash"
 
 
 def new_run_id() -> str:
@@ -68,4 +70,20 @@ def load_run(run_id: str) -> tuple[dict, dict]:
 
 
 def delete_run(run_id: str) -> None:
-    shutil.rmtree(RUNS_DIR / run_id, ignore_errors=True)
+    """Kaydı çöp kutusuna taşır (kalıcı silmez)."""
+    src, dst = RUNS_DIR / run_id, TRASH_DIR / run_id
+    if not src.exists():
+        return
+    TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(dst, ignore_errors=True)  # aynı id daha önce silinip geri yüklendiyse eski kopya
+    src.replace(dst)
+
+
+def restore_run(run_id: str) -> bool:
+    """Çöp kutusundaki kaydı geri taşır; kayıt yoksa ya da aynı id zaten varsa False."""
+    src, dst = TRASH_DIR / run_id, RUNS_DIR / run_id
+    if not src.exists() or dst.exists():
+        return False
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    src.replace(dst)
+    return True

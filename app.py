@@ -36,10 +36,34 @@ def load_run_into_state(run_id):
         state.model_label = label
 
 
-def delete_run(run_id):
-    history.delete_run(run_id)
-    if st.session_state.get("run_id") == run_id:
-        st.session_state.run_id = None
+@st.dialog("Kaydı sil")
+def confirm_delete(meta):
+    st.write(f"**{meta['saved_at']} · {meta['source']}** kaydı silinsin mi?")
+    st.caption(f"{(meta['titles'] or meta['links'] or ['?'])[0][:80]} — {meta['n_items']} öğe"
+               + ("" if meta["n_selected"] is None else f", {meta['n_selected']} seçili"))
+    st.caption("Kayıt çöp kutusuna (`data/trash/`) taşınır, kenar çubuğundan geri alınabilir.")
+    y, n = st.columns(2)
+    if y.button("Evet, sil", type="primary", width="stretch"):
+        state = st.session_state
+        history.delete_run(meta["id"])
+        was_open = state.get("run_id") == meta["id"]
+        if was_open:
+            state.run_id = None
+        state.deleted_runs.append({"id": meta["id"], "label": f"{meta['saved_at']} · {meta['source']}",
+                                   "was_open": was_open})
+        st.rerun()
+    if n.button("Vazgeç", width="stretch"):
+        st.rerun()
+
+
+def undo_delete():
+    state = st.session_state
+    last = state.deleted_runs.pop()
+    if history.restore_run(last["id"]):
+        if last["was_open"] and state.get("run_id") is None:
+            state.run_id = last["id"]
+    else:
+        state.undo_error = f"{last['label']} geri alınamadı (çöp kutusunda yok ya da aynı kayıt zaten var)."
 
 
 def save_current_run(criteria, model, backend):
@@ -98,6 +122,7 @@ state.setdefault("run_id", None)        # geçmişteki kayıt (data/runs/<id>)
 state.setdefault("run_filtered", False)  # bu kayıtta ayıklama sonucu var mı
 state.setdefault("run_source", source)
 state.setdefault("exact_tokens", {})    # tahmin anahtarı -> count_tokens sonucu
+state.setdefault("deleted_runs", [])    # bu oturumda silinenler (geri al yığını)
 model = MODELS[model_label]
 
 c1, c2, c3 = st.columns(3)
@@ -214,6 +239,12 @@ if all_items:
 with st.sidebar:
     st.subheader("🕘 Geçmiş")
     runs = history.list_runs()
+    if state.get("undo_error"):
+        st.error(state.pop("undo_error"))
+    if state.deleted_runs:
+        u1, u2 = st.columns([3, 2], vertical_alignment="center")
+        u1.caption(f"Silindi: {state.deleted_runs[-1]['label']}")
+        u2.button("↩️ Geri al", on_click=undo_delete, width="stretch")
     if not runs:
         st.caption("Henüz kayıt yok. Çekilen veri ve sonuçlar `data/runs/` altına otomatik kaydedilir.")
     else:
@@ -231,7 +262,8 @@ with st.sidebar:
             st.caption(f"Prompt: {meta['criteria'][:200]}")
         h1, h2 = st.columns(2)
         h1.button("Yükle", on_click=load_run_into_state, args=(selected_run,), width="stretch")
-        h2.button("Sil", on_click=delete_run, args=(selected_run,), width="stretch")
+        if h2.button("Sil", width="stretch"):
+            confirm_delete(meta)
 
 # Açık kaydı URL'de tut: yenileyince/linki başka cihazda açınca aynı kayıt gelir
 if state.run_id:
