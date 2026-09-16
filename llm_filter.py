@@ -1,8 +1,10 @@
-"""Yorumları kullanıcının prompt'una göre Claude ile ayıklar.
+"""Yorumları kullanıcının prompt'una göre LLM ile ayıklar.
 
-İki backend:
-- "api": Anthropic SDK (ANTHROPIC_API_KEY gerekir)
-- "cli": yerel `claude -p` (Claude Code aboneliğiyle çalışır, API anahtarı gerekmez)
+Sağlayıcı başına backend:
+- anthropic: "api" (Anthropic SDK) ya da "cli" (yerel `claude -p`, Claude Code aboneliğiyle çalışır)
+- google: yalnızca "api" (google-genai SDK)
+API anahtarı ortam değişkeninde yoksa arayüz kullanıcıdan ister ve çağrılara doğrudan iletilir
+(diske/geçmişe yazılmaz).
 """
 import json
 import os
@@ -13,24 +15,36 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import anthropic
 from pydantic import BaseModel, Field
 
-MODELS = {
-    "Claude Opus 5": "claude-opus-5",
-    "Claude Sonnet 5": "claude-sonnet-5",
-    "Claude Haiku 4.5": "claude-haiku-4-5",
+# Sağlayıcı başına API anahtarı ortam değişkeni + arayüzde gösterilecek ad
+PROVIDERS = {
+    "anthropic": {"env": "ANTHROPIC_API_KEY", "label": "Anthropic"},
+    "google": {"env": "GEMINI_API_KEY", "label": "Google Gemini"},
 }
+
+MODELS = {
+    "Claude Opus 5": {"id": "claude-opus-5", "provider": "anthropic"},
+    "Claude Sonnet 5": {"id": "claude-sonnet-5", "provider": "anthropic"},
+    "Claude Haiku 4.5": {"id": "claude-haiku-4-5", "provider": "anthropic"},
+    "Gemini 3.1 Flash (Preview)": {"id": "gemini-3.1-flash-preview", "provider": "google"},
+}
+MODEL_PROVIDER = {v["id"]: v["provider"] for v in MODELS.values()}
 
 # (giriş, çıkış) $ / 1M token
 PRICES = {
     "claude-opus-5": (5.0, 25.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-haiku-4-5": (1.0, 5.0),
+    "gemini-3.1-flash-preview": (0.075, 0.30),  # tahmini; önizleme modeli, resmi fiyatı teyit edilmedi
 }
 # Maliyet tahmini varsayımları
 CHARS_PER_TOKEN = 3.0          # Türkçe metinde kabaca; tam sayım için count_tokens kullanılır
 SCHEMA_OVERHEAD = 250          # yapılandırılmış çıktı şemasının sisteme eklediği token
-PICK_TOKENS = 45               # seçilen öğe başına çıktı (index, puan, tek cümlelik gerekçe)
+BASE_PICK_TOKENS = 12          # seçilen öğe başına çıktı: indeks + puan
+GROUP_TOKENS = 10              # seçilen öğe başına ek çıktı: kısa grup adı (gruplama özelliğinin maliyeti)
+PICK_TOKENS = BASE_PICK_TOKENS + GROUP_TOKENS
 SELECT_RATIO = (0.1, 0.5)      # seçilme oranı aralığı
-THINKING_TOKENS = (300, 3000)  # parti başına düşünme tokenı (Haiku 4.5'te düşünme kapalı)
+THINKING_TOKENS = (300, 3000)  # parti başına düşünme tokenı (Haiku 4.5 ve Gemini Flash'ta düşünme kapalı)
+NO_THINKING_MODELS = {"claude-haiku-4-5", "gemini-3.1-flash-preview"}
 
 # Her prompt'un sonuna sabit eklenir (arayüzde görünür, kullanıcı tekrar yazmasın)
 TRANSLATE_SUFFIX = "seçtiğin yorumlardan türkçe olmayanları türkçeye çevir"
@@ -38,7 +52,10 @@ TRANSLATE_SUFFIX = "seçtiğin yorumlardan türkçe olmayanları türkçeye çev
 SYSTEM = """Sen bir içerik ayıklama asistanısın. Kullanıcı sana bir YouTube videosunun yorumlarını \
 veya bir Ekşi Sözlük başlığının entry'lerini ve bir ayıklama kriteri verecek.
 Her öğe [numara] ile başlar. Kritere gerçekten uyan, işe yarar öğeleri seç; uymayanları dahil etme.
-Her seçilen öğe için: numarası, 1-10 arası uygunluk puanı ve kısa (tek cümle, Türkçe) seçilme gerekçesi ver.
+Seçtiğin her öğeyi ortak temasına göre kısa bir Türkçe grup adına ata (ör. "hacamat önerenler", \
+"doktora gitmeyi tavsiye edenler"). Az sayıda, genel grup adı kullan; birbirine benzer öğelerde grup adını \
+harfiyen aynı yaz ki aynı grupta toplansınlar. Her öğeye ayrı bir grup uydurma.
+Her seçilen öğe için: numarası, 1-10 arası uygunluk puanı ve grup adı ver.
 Kriter çeviri istiyorsa, Türkçe olmayan seçilmiş öğelerin tam Türkçe çevirisini translation alanına yaz; \
 Türkçe olanlar için translation boş string olsun.
 Hiçbiri uymuyorsa boş liste döndür."""
@@ -47,7 +64,8 @@ Hiçbiri uymuyorsa boş liste döndür."""
 class Pick(BaseModel):
     index: int
     score: int
-    reason: str
+    group: str = Field(description="Öğenin ait olduğu kısa Türkçe grup/tema adı; aynı temadaki öğelerde "
+                                    "birebir aynı ifadeyi kullan")
     translation: str = Field(description="Öğe Türkçe değilse tam Türkçe çevirisi, Türkçeyse boş string")
 
 
@@ -109,9 +127,9 @@ def build_requests(items: list[dict], criteria: str, batch_size: int) -> list[tu
     return [(o, _user_message(criteria, items[o:o + batch_size], o)) for o in range(0, len(items), batch_size)]
 
 
-def count_input_tokens(model: str, messages: list[str], workers: int = 4) -> int:
+def count_input_tokens(model: str, messages: list[str], workers: int = 4, api_key: str | None = None) -> int:
     """Anthropic token sayma API'si ile tam giriş tokenı (ücretsiz, API kimlik bilgisi gerekir)."""
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     def count(msg):
         return client.messages.count_tokens(
@@ -128,17 +146,22 @@ def estimate_cost(model: str, messages: list[str], n_items: int, input_tokens: i
     exact = input_tokens is not None
     if not exact:
         input_tokens = round(chars / CHARS_PER_TOKEN) + SCHEMA_OVERHEAD * n_batches
-    thinking = (0, 0) if model == "claude-haiku-4-5" else THINKING_TOKENS
+    thinking = (0, 0) if model in NO_THINKING_MODELS else THINKING_TOKENS
     out_lo = round(n_items * SELECT_RATIO[0] * PICK_TOKENS) + thinking[0] * n_batches
     out_hi = round(n_items * SELECT_RATIO[1] * PICK_TOKENS) + thinking[1] * n_batches
     price_in, price_out = PRICES[model]
     cost = lambda out: (input_tokens * price_in + out * price_out) / 1_000_000
+    # Gruplama özelliğinin (GROUP_TOKENS) çıktı maliyetine eklediği pay, ayrı gösterebilmek için
+    group_lo = round(n_items * SELECT_RATIO[0] * GROUP_TOKENS)
+    group_hi = round(n_items * SELECT_RATIO[1] * GROUP_TOKENS)
+    group_cost = (cost(out_lo) - cost(out_lo - group_lo), cost(out_hi) - cost(out_hi - group_hi))
     return {"batches": n_batches, "chars": chars, "input_tokens": input_tokens, "exact": exact,
-            "output_tokens": (out_lo, out_hi), "cost": (cost(out_lo), cost(out_hi))}
+            "output_tokens": (out_lo, out_hi), "cost": (cost(out_lo), cost(out_hi)), "group_cost": group_cost}
 
 
-def _call_api(model: str, message: str, system: str = SYSTEM, schema: type[BaseModel] = Picks):
-    client = anthropic.Anthropic()
+def _call_api(model: str, message: str, system: str = SYSTEM, schema: type[BaseModel] = Picks,
+              api_key: str | None = None):
+    client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
     kwargs = {}
     if model == "claude-opus-5":
         # Opus 5 bir isteği reddederse sunucu tarafında otomatik olarak başka modele düşer
@@ -158,7 +181,8 @@ def _call_api(model: str, message: str, system: str = SYSTEM, schema: type[BaseM
     return response.parsed_output
 
 
-def _call_cli(model: str, message: str, system: str = SYSTEM, schema: type[BaseModel] = Picks):
+def _call_cli(model: str, message: str, system: str = SYSTEM, schema: type[BaseModel] = Picks,
+              api_key: str | None = None):
     cmd = [
         "claude", "-p", system,
         "--output-format", "json",
@@ -178,20 +202,46 @@ def _call_cli(model: str, message: str, system: str = SYSTEM, schema: type[BaseM
     return schema.model_validate(data["structured_output"])
 
 
-def filter_items(items: list[dict], criteria: str, model: str, backend: str,
-                 batch_size: int = 150, workers: int = 4, on_progress=None) -> tuple[list[dict], list[str]]:
-    """(seçilenler, hatalar) döndürür. Seçilenlere score/reason eklenir, puana göre sıralanır."""
-    call = _call_api if backend == "api" else _call_cli
+def _call_gemini(model: str, message: str, system: str = SYSTEM, schema: type[BaseModel] = Picks,
+                 api_key: str | None = None):
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+    response = client.models.generate_content(
+        model=model,
+        contents=message,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            response_mime_type="application/json",
+            response_schema=schema,
+        ),
+    )
+    if response.parsed is None:
+        raise RuntimeError(f"Gemini yapılandırılmış çıktı döndürmedi: {str(response.text)[:500]}")
+    return response.parsed
+
+
+def _dispatch(model: str, backend: str):
+    if MODEL_PROVIDER.get(model) == "google":
+        return _call_gemini
+    return _call_api if backend == "api" else _call_cli
+
+
+def filter_items(items: list[dict], criteria: str, model: str, backend: str, batch_size: int = 150,
+                 workers: int = 4, on_progress=None, api_key: str | None = None) -> tuple[list[dict], list[str]]:
+    """(seçilenler, hatalar) döndürür. Seçilenlere score/group eklenir, puana göre sıralanır."""
+    call = _dispatch(model, backend)
     batches = build_requests(items, criteria, batch_size)
     results, errors, done = [], [], 0
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(call, model, msg): o for o, msg in batches}
+        futures = {pool.submit(call, model, msg, SYSTEM, Picks, api_key): o for o, msg in batches}
         for fut in as_completed(futures):
             try:
                 for p in fut.result().selected:
                     if 0 <= p.index < len(items):
-                        picked = {**items[p.index], "score": p.score, "reason": p.reason}
+                        picked = {**items[p.index], "score": p.score, "group": p.group}
                         if p.translation.strip():  # Türkçe olmayan: yalnızca çevirisi tutulur
                             picked["text"] = p.translation.strip()
                         picked["translated"] = bool(p.translation.strip())
@@ -214,16 +264,16 @@ def needs_translation_check(results: list[dict] | None) -> bool:
 
 
 def translate_items(items: list[dict], model: str, backend: str, batch_size: int = 40, workers: int = 4,
-                    on_progress=None) -> tuple[list[dict], list[str]]:
+                    on_progress=None, api_key: str | None = None) -> tuple[list[dict], list[str]]:
     """Önceden seçilmiş öğelerden Türkçe olmayanların metnini Türkçe çevirisiyle değiştirir.
     (yeni öğe listesi, hatalar) döndürür; hatalı partideki öğeler kontrol edilmemiş kalır."""
-    call = _call_api if backend == "api" else _call_cli
+    call = _dispatch(model, backend)
     out = [dict(it) for it in items]
     batches = [(o, "<yorumlar>\n" + _format_batch(items[o:o + batch_size], o) + "\n</yorumlar>")
                for o in range(0, len(items), batch_size)]
     errors, done = [], 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(call, model, msg, TRANSLATE_SYSTEM, Translations): o for o, msg in batches}
+        futures = {pool.submit(call, model, msg, TRANSLATE_SYSTEM, Translations, api_key): o for o, msg in batches}
         for fut in as_completed(futures):
             o = futures[fut]
             try:

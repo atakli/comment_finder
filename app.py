@@ -1,13 +1,15 @@
-"""Web arayüzü: YouTube / Ekşi Sözlük'ten yorum çek, prompt'a göre Claude ile ayıkla."""
+"""Web arayüzü: YouTube / Ekşi Sözlük'ten yorum çek, prompt'a göre LLM ile ayıkla."""
+import os
 import re
+from collections import Counter
 
 import pandas as pd
 import streamlit as st
 
 import history
-from llm_filter import (MODELS, TRANSLATE_SUFFIX, build_requests, count_input_tokens, default_backend, estimate_cost,
-                        filter_items, needs_translation_check, strip_translate_suffix, translate_items,
-                        with_translate_suffix)
+from llm_filter import (MODELS, PROVIDERS, TRANSLATE_SUFFIX, build_requests, count_input_tokens, default_backend,
+                        estimate_cost, filter_items, needs_translation_check, strip_translate_suffix,
+                        translate_items, with_translate_suffix)
 from scrapers import fetch_comments, fetch_entries
 
 st.set_page_config(page_title="Yorum Ayıklayıcı", page_icon="🔎", layout="wide")
@@ -39,7 +41,7 @@ def fold(text):
     return "".join(c.lower() if len(c.lower()) == 1 else c for c in text)
 
 
-def matches(item, query, fields=("text", "reason", "author", "title")):
+def matches(item, query, fields=("text", "group", "author", "title")):
     return fold(query) in fold(" ".join(str(item.get(f) or "") for f in fields))
 
 
@@ -82,11 +84,10 @@ def item_browser(rows, cols, column_config, key, query):
             info.append("🌐 Türkçeye çevrildi")
         if it.get("score") is not None:
             info.append(f"⭐ {it['score']}/10")
+        if it.get("group"):
+            info.append(f"🏷️ {md_escape(str(it['group']))}")
         st.markdown(" · ".join(x for x in info if x))
         st.markdown(highlight(it.get("text"), query))
-        if it.get("reason"):
-            st.caption("Gerekçe")
-            st.markdown(highlight(it["reason"], query))
         st.divider()
         st.caption(md_escape(str(it.get("title") or "")))
         if it.get("link"):
@@ -102,7 +103,7 @@ def load_run_into_state(run_id):
     state.run_source = meta["source"]
     state.source, state.links_text = meta["source"], "\n".join(meta["links"])
     state.criteria = strip_translate_suffix(meta["criteria"])  # sabit ek tekrar yazılmasın
-    label = next((k for k, v in MODELS.items() if v == meta["model"]), None)
+    label = next((k for k, v in MODELS.items() if v["id"] == meta["model"]), None)
     if label:
         state.model_label = label
 
@@ -168,11 +169,29 @@ with st.sidebar:
         max_pages = st.number_input("Başlık başına en fazla sayfa (sayfa = 10 entry)", 1, 1000, 20)
         nice = st.checkbox("Şükela sıralaması (en çok favorilenenler önce)", value=True)
 
-    st.subheader("Ayıklama (Claude)")
-    backends = {"cli": "Claude Code CLI (abonelik)", "api": "Anthropic API (ANTHROPIC_API_KEY)"}
-    backend = st.radio("Backend", list(backends), format_func=backends.get,
-                       index=list(backends).index(default_backend()))
+    st.subheader("Ayıklama (LLM)")
     model_label = st.selectbox("Model", list(MODELS), key="model_label")
+    model_info = MODELS[model_label]
+    model, provider = model_info["id"], model_info["provider"]
+
+    if provider == "anthropic":
+        backends = {"cli": "Claude Code CLI (abonelik)", "api": "Anthropic API (ANTHROPIC_API_KEY)"}
+        backend = st.radio("Backend", list(backends), format_func=backends.get,
+                           index=list(backends).index(default_backend()))
+    else:
+        backend = "api"
+        st.caption(f"{PROVIDERS[provider]['label']} modeli doğrudan API ile çağrılır (CLI seçeneği yok).")
+
+    api_key = None
+    if backend == "api":
+        env_var = PROVIDERS[provider]["env"]
+        if not os.environ.get(env_var):
+            api_key = st.text_input(f"{PROVIDERS[provider]['label']} API anahtarı", type="password",
+                                    key=f"apikey_{provider}").strip() or None
+            if not api_key:
+                st.caption(f"ℹ️ {env_var} tanımlı değil; ayıklamak için API anahtarını girip Enter'a basın.")
+    key_ready = backend != "api" or bool(api_key or os.environ.get(PROVIDERS[provider]["env"]))
+
     batch_size = st.number_input("İstek başına yorum sayısı", 20, 500, 150, step=10)
     workers = st.number_input("Paralel istek", 1, 8, 4)
 
@@ -199,7 +218,6 @@ state.setdefault("run_filtered", False)  # bu kayıtta ayıklama sonucu var mı
 state.setdefault("run_source", source)
 state.setdefault("exact_tokens", {})    # tahmin anahtarı -> count_tokens sonucu
 state.setdefault("deleted_runs", [])    # bu oturumda silinenler (geri al yığını)
-model = MODELS[model_label]
 
 c1, c2, c3 = st.columns(3)
 fetch_clicked = c1.button("1️⃣ Yorumları çek", width="stretch")
@@ -233,10 +251,10 @@ if fetched_items and criteria.strip():
     n_total = sum(len(items) for _, items in fetched_items)
     est_key = (model, criteria, int(batch_size), state.run_id)
     with st.expander("💰 Ayıklama öncesi maliyet tahmini", expanded=state.results is None):
-        if backend == "api" and st.button("Token'ları API ile tam say (ücretsiz)"):
+        if backend == "api" and provider == "anthropic" and st.button("Token'ları API ile tam say (ücretsiz)"):
             try:
                 with st.spinner("Token sayılıyor..."):
-                    state.exact_tokens = {est_key: count_input_tokens(model, requests, int(workers))}
+                    state.exact_tokens = {est_key: count_input_tokens(model, requests, int(workers), api_key)}
             except Exception as e:
                 st.error(f"Token sayılamadı: {e}")
         est = estimate_cost(model, requests, n_total, state.exact_tokens.get(est_key))
@@ -245,28 +263,35 @@ if fetched_items and criteria.strip():
         m2.metric("Giriş token", f"{'' if est['exact'] else '~'}{est['input_tokens']:,}")
         m3.metric("Çıkış token", "{:,}–{:,}".format(*est["output_tokens"]))
         m4.metric(f"Tahmini maliyet ({model_label})", "${:.2f}–${:.2f}".format(*est["cost"]))
+        st.caption("🏷️ Bunun içinde gruplama özelliğinin payı: ${:.3f}–${:.3f}".format(*est["group_cost"]))
         notes = ["Giriş tokenı " + ("token sayma API'siyle ölçüldü." if est["exact"]
                                     else "karakter sayısından yaklaşık hesaplandı (~3 karakter/token).")]
-        notes.append("Çıkış aralığı öğelerin %10–50'sinin seçileceği ve (Haiku dışında) parti başına "
-                     "300–3000 düşünme tokenı varsayar.")
+        notes.append("Çıkış aralığı öğelerin %10–50'sinin seçileceği, seçilen her öğe için indeks/puan/grup "
+                     "adı üretileceği ve (Haiku/Gemini Flash dışında) parti başına 300–3000 düşünme tokenı "
+                     "varsayar.")
         if backend == "cli":
             notes.append("CLI backend'inde doğrudan ücret yok; bu tutar Claude aboneliğinin kullanım "
                          "kotasından düşer (CLI kendi sistem prompt'unu da ekler).")
+        if provider != "anthropic":
+            notes.append(f"{PROVIDERS[provider]['label']} fiyatlandırması tahminidir, güncel fiyatı sağlayıcıdan "
+                         "teyit edin.")
         st.caption(" ".join(notes))
 
 if (filter_clicked or both_clicked) and state.fetched:
     if not criteria.strip():
         st.warning("Ayıklama prompt'u girin.")
+    elif not key_ready:
+        st.warning(f"{PROVIDERS[provider]['env']} tanımlı değil ve API anahtarı girilmedi.")
     else:
         results, errors = [], []
-        bar = st.progress(0.0, text="Claude ayıklıyor...")
+        bar = st.progress(0.0, text="Ayıklanıyor...")
         sources = [(link, items) for link, items in state.fetched.items() if items]
         for n, (link, items) in enumerate(sources):
             def progress(done, total, n=n):
                 bar.progress((n + done / total) / len(sources),
                              text=f"Kaynak {n + 1}/{len(sources)} · parti {done}/{total}")
             picked, errs = filter_items(items, full_criteria, model, backend,
-                                        int(batch_size), int(workers), progress)
+                                        int(batch_size), int(workers), progress, api_key)
             results += picked
             errors += [f"{link} → {e}" for e in errs]
         bar.empty()
@@ -293,19 +318,30 @@ link_cfg = {"link": st.column_config.LinkColumn("link", display_text="aç"),
 
 query = ""
 if all_items:
-    query = st.text_input("🔍 Ara", placeholder="Metin, gerekçe, yazar veya başlıkta ara",
+    query = st.text_input("🔍 Ara", placeholder="Metin, grup, yazar veya başlıkta ara",
                           key="search_query").strip()
 table_key = f"{state.run_id}_{fold(query)}"  # arama/kayıt değişince seçim sıfırlanır
 
 if state.results is not None:
-    shown = [r for r in state.results if matches(r, query)] if query else state.results
+    groups = sorted({r["group"] for r in state.results if r.get("group")})
+    group_filter = "Tümü"
+    if groups:
+        g1, g2 = st.columns([2, 3], vertical_alignment="center")
+        with g1:
+            group_filter = st.selectbox("Gruba göre süz", ["Tümü"] + groups, key=f"group_filter_{state.run_id}")
+        with g2:
+            counts = Counter(r["group"] for r in state.results if r.get("group"))
+            st.caption(" · ".join(f"{g} ({c})" for g, c in counts.most_common()))
+    shown = [r for r in state.results
+             if (not query or matches(r, query)) and (group_filter == "Tümü" or r.get("group") == group_filter)]
+    res_table_key = f"{table_key}_{group_filter}"  # arama/kayıt/grup değişince seçim sıfırlanır
     if needs_translation_check(state.results):
         t1, t2 = st.columns([3, 1], vertical_alignment="center")
         t1.info("Bu kayıt çeviri özelliğinden önce ayıklanmış; seçilenlerde Türkçe olmayan yorumlar olabilir.", icon="🌐")
         if t2.button("🌐 Türkçe olmayanları çevir", width="stretch"):
-            bar = st.progress(0.0, text="Claude çeviriyor...")
+            bar = st.progress(0.0, text="Çevriliyor...")
             state.results, errs = translate_items(
-                state.results, model, backend, workers=int(workers),
+                state.results, model, backend, workers=int(workers), api_key=api_key,
                 on_progress=lambda d, t: bar.progress(d / t, text=f"Çeviri partisi {d}/{t}"))
             bar.empty()
             state.errors = [e for e in state.errors if not e.startswith("Çeviri partisi")] + errs
@@ -316,11 +352,11 @@ if state.results is not None:
                 st.warning("Kayıt bulunamadı; çeviri yalnızca bu oturumda geçerli.")
             st.rerun()
     st.subheader(f"✅ Seçilenler: {len(state.results)} / {len(all_items)}"
-                 + (f" · aramada {len(shown)}" if query else ""))
-    cols = ["score", "text", "reason", "likes", "author", "date", "title", "link"]
+                 + (f" · süzülen {len(shown)}" if len(shown) != len(state.results) else ""))
+    cols = ["score", "group", "text", "likes", "author", "date", "title", "link"]
     item_browser(shown, cols, {
         **link_cfg, "score": st.column_config.ProgressColumn("puan", min_value=0, max_value=10, format="%d"),
-        "reason": st.column_config.TextColumn("gerekçe", width="medium")}, f"res_{table_key}", query)
+        "group": st.column_config.TextColumn("grup", width="medium")}, f"res_{res_table_key}", query)
     df = to_df(state.results, cols)
     d1, d2 = st.columns(2)
     d1.download_button("CSV indir", df.to_csv(index=False).encode("utf-8-sig"), "secilenler.csv", "text/csv")
