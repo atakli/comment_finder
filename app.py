@@ -2,7 +2,8 @@
 import pandas as pd
 import streamlit as st
 
-from llm_filter import MODELS, default_backend, filter_items
+import history
+from llm_filter import MODELS, build_requests, count_input_tokens, default_backend, estimate_cost, filter_items
 from scrapers import fetch_comments, fetch_entries
 
 st.set_page_config(page_title="Yorum Ayıklayıcı", page_icon="🔎", layout="wide")
@@ -22,9 +23,37 @@ def to_df(rows, cols):
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
 
+def load_run_into_state(run_id):
+    """Geçmişten bir çalıştırmayı yükler (on_click: widget'lar çizilmeden önce çalışır)."""
+    meta, data = history.load_run(run_id)
+    state = st.session_state
+    state.fetched, state.results, state.errors = data["fetched"], data["results"], data["errors"]
+    state.run_id, state.run_filtered = run_id, data["results"] is not None
+    state.run_source = meta["source"]
+    state.source, state.links_text, state.criteria = meta["source"], "\n".join(meta["links"]), meta["criteria"]
+    label = next((k for k, v in MODELS.items() if v == meta["model"]), None)
+    if label:
+        state.model_label = label
+
+
+def delete_run(run_id):
+    history.delete_run(run_id)
+    if st.session_state.get("run_id") == run_id:
+        st.session_state.run_id = None
+
+
+def save_current_run(criteria, model, backend):
+    state = st.session_state
+    try:
+        history.save_run(state.run_id, source=state.run_source, criteria=criteria, model=model,
+                         backend=backend, fetched=state.fetched, results=state.results, errors=state.errors)
+    except OSError as e:
+        st.warning(f"Geçmişe kaydedilemedi: {e}")
+
+
 # ---------------- Kenar çubuğu ----------------
 with st.sidebar:
-    source = st.radio("Kaynak", ["YouTube", "Ekşi Sözlük"], horizontal=True)
+    source = st.radio("Kaynak", ["YouTube", "Ekşi Sözlük"], horizontal=True, key="source")
 
     st.subheader("Çekme ayarları")
     if source == "YouTube":
@@ -38,7 +67,7 @@ with st.sidebar:
     backends = {"cli": "Claude Code CLI (abonelik)", "api": "Anthropic API (ANTHROPIC_API_KEY)"}
     backend = st.radio("Backend", list(backends), format_func=backends.get,
                        index=list(backends).index(default_backend()))
-    model_label = st.selectbox("Model", list(MODELS))
+    model_label = st.selectbox("Model", list(MODELS), key="model_label")
     batch_size = st.number_input("İstek başına yorum sayısı", 20, 500, 150, step=10)
     workers = st.number_input("Paralel istek", 1, 8, 4)
 
@@ -46,15 +75,20 @@ with st.sidebar:
 st.title("🔎 Yorum Ayıklayıcı")
 placeholder = ("https://www.youtube.com/watch?v=...\nhttps://youtu.be/..." if source == "YouTube"
                else "https://eksisozluk.com/baslik-adi--123456\nveya doğrudan başlık adı")
-links_text = st.text_area("Linkler (her satıra bir tane)", placeholder=placeholder, height=110)
+links_text = st.text_area("Linkler (her satıra bir tane)", placeholder=placeholder, height=110, key="links_text")
 criteria = st.text_area("Ayıklama prompt'u",
                         placeholder="Örn: Ürünü uzun süre kullanmış kişilerin somut deneyimleri ve "
-                                    "yaşadıkları kronik sorunlar", height=90)
+                                    "yaşadıkları kronik sorunlar", height=90, key="criteria")
 
 state = st.session_state
 state.setdefault("fetched", {})     # link -> öğeler
 state.setdefault("results", None)
 state.setdefault("errors", [])
+state.setdefault("run_id", None)        # geçmişteki kayıt (data/runs/<id>)
+state.setdefault("run_filtered", False)  # bu kayıtta ayıklama sonucu var mı
+state.setdefault("run_source", source)
+state.setdefault("exact_tokens", {})    # tahmin anahtarı -> count_tokens sonucu
+model = MODELS[model_label]
 
 c1, c2, c3 = st.columns(3)
 fetch_clicked = c1.button("1️⃣ Yorumları çek", width="stretch")
@@ -77,6 +111,37 @@ if fetch_clicked or both_clicked:
                         state.fetched[link] = cached_eksi(link, int(max_pages), nice)
                 except Exception as e:
                     st.error(f"{link} çekilemedi: {e}")
+        if state.fetched:
+            state.run_id, state.run_filtered, state.run_source = history.new_run_id(), False, source
+            save_current_run(criteria, model, backend)
+
+# ---------------- Maliyet tahmini ----------------
+fetched_items = [(link, items) for link, items in state.fetched.items() if items]
+if fetched_items and criteria.strip():
+    requests = [msg for _, items in fetched_items for _, msg in build_requests(items, criteria, int(batch_size))]
+    n_total = sum(len(items) for _, items in fetched_items)
+    est_key = (model, criteria, int(batch_size), state.run_id)
+    with st.expander("💰 Ayıklama öncesi maliyet tahmini", expanded=state.results is None):
+        if backend == "api" and st.button("Token'ları API ile tam say (ücretsiz)"):
+            try:
+                with st.spinner("Token sayılıyor..."):
+                    state.exact_tokens = {est_key: count_input_tokens(model, requests, int(workers))}
+            except Exception as e:
+                st.error(f"Token sayılamadı: {e}")
+        est = estimate_cost(model, requests, n_total, state.exact_tokens.get(est_key))
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("İstek (parti)", est["batches"], help=f"{n_total} öğe, {est['chars']:,} karakter")
+        m2.metric("Giriş token", f"{'' if est['exact'] else '~'}{est['input_tokens']:,}")
+        m3.metric("Çıkış token", "{:,}–{:,}".format(*est["output_tokens"]))
+        m4.metric(f"Tahmini maliyet ({model_label})", "${:.2f}–${:.2f}".format(*est["cost"]))
+        notes = ["Giriş tokenı " + ("token sayma API'siyle ölçüldü." if est["exact"]
+                                    else "karakter sayısından yaklaşık hesaplandı (~3 karakter/token).")]
+        notes.append("Çıkış aralığı öğelerin %10–50'sinin seçileceği ve (Haiku dışında) parti başına "
+                     "300–3000 düşünme tokenı varsayar.")
+        if backend == "cli":
+            notes.append("CLI backend'inde doğrudan ücret yok; bu tutar Claude aboneliğinin kullanım "
+                         "kotasından düşer (CLI kendi sistem prompt'unu da ekler).")
+        st.caption(" ".join(notes))
 
 if (filter_clicked or both_clicked) and state.fetched:
     if not criteria.strip():
@@ -89,13 +154,17 @@ if (filter_clicked or both_clicked) and state.fetched:
             def progress(done, total, n=n):
                 bar.progress((n + done / total) / len(sources),
                              text=f"Kaynak {n + 1}/{len(sources)} · parti {done}/{total}")
-            picked, errs = filter_items(items, criteria, MODELS[model_label], backend,
+            picked, errs = filter_items(items, criteria, model, backend,
                                         int(batch_size), int(workers), progress)
             results += picked
             errors += [f"{link} → {e}" for e in errs]
         bar.empty()
         state.results = sorted(results, key=lambda r: (-r["score"], -r["likes"]))
         state.errors = errors
+        if state.run_id is None or state.run_filtered:  # önceki sonucu ezme, yeni kayıt aç
+            state.run_id = history.new_run_id()
+        state.run_filtered = True
+        save_current_run(criteria, model, backend)
 elif filter_clicked:
     st.warning("Önce yorumları çekin.")
 
@@ -130,3 +199,26 @@ if all_items:
         st.dataframe(raw, width="stretch", hide_index=True, column_config=link_cfg)
         st.download_button("Ham veriyi CSV indir", raw.to_csv(index=False).encode("utf-8-sig"),
                            "tum_yorumlar.csv", "text/csv")
+
+# ---------------- Geçmiş (kenar çubuğunun sonuna, bu çalıştırmadaki kayıtlar dahil) ----------------
+with st.sidebar:
+    st.subheader("🕘 Geçmiş")
+    runs = history.list_runs()
+    if not runs:
+        st.caption("Henüz kayıt yok. Çekilen veri ve sonuçlar `data/runs/` altına otomatik kaydedilir.")
+    else:
+        labels = {
+            r["id"]: f"{r['saved_at']} · {r['source']} · "
+                     f"{'ayıklanmadı' if r['n_selected'] is None else str(r['n_selected']) + ' seçili'}"
+                     f"/{r['n_items']} · {(r['titles'] or r['links'] or ['?'])[0][:30]}"
+            for r in runs
+        }
+        ids = list(labels)
+        selected_run = st.selectbox("Kayıtlı çalıştırmalar", ids, format_func=labels.get,
+                                    index=ids.index(state.run_id) if state.run_id in ids else 0)
+        meta = next(r for r in runs if r["id"] == selected_run)
+        if meta["criteria"]:
+            st.caption(f"Prompt: {meta['criteria'][:200]}")
+        h1, h2 = st.columns(2)
+        h1.button("Yükle", on_click=load_run_into_state, args=(selected_run,), width="stretch")
+        h2.button("Sil", on_click=delete_run, args=(selected_run,), width="stretch")
