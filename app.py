@@ -1,4 +1,6 @@
 """Web arayüzü: YouTube / Ekşi Sözlük'ten yorum çek, prompt'a göre Claude ile ayıkla."""
+import re
+
 import pandas as pd
 import streamlit as st
 
@@ -21,6 +23,70 @@ def cached_eksi(url, max_pages, nice):
 
 def to_df(rows, cols):
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+# Türkçe büyük/küçük harf ve i/ı farkını yok say (karakter sayısı korunur, vurgulama konumları kaymaz)
+_FOLD = str.maketrans({"İ": "i", "I": "i", "ı": "i"})
+
+
+def fold(text):
+    text = str(text or "").translate(_FOLD)
+    folded = text.lower()
+    if len(folded) == len(text):
+        return folded
+    return "".join(c.lower() if len(c.lower()) == 1 else c for c in text)
+
+
+def matches(item, query, fields=("text", "reason", "author", "title")):
+    return fold(query) in fold(" ".join(str(item.get(f) or "") for f in fields))
+
+
+def md_escape(text):
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~$:])", r"\\\1", text)
+
+
+def highlight(text, query):
+    """Markdown güvenli metin; aranan ifade vurgulu, satır sonları korunur."""
+    text, q = str(text or ""), fold(query.strip())
+    parts, pos = [], 0
+    if q:
+        folded = fold(text)
+        if len(folded) == len(text):
+            for m in re.finditer(re.escape(q), folded):
+                parts.append(md_escape(text[pos:m.start()]))
+                parts.append(f":orange[**{md_escape(text[m.start():m.end()])}**]")
+                pos = m.end()
+    parts.append(md_escape(text[pos:]))
+    return "".join(parts).replace("\n", "  \n")
+
+
+def item_browser(rows, cols, column_config, key, query):
+    """Tablo + tıklanan satırın tam metnini gösteren detay paneli."""
+    table, detail = st.columns([3, 2])
+    with table:
+        event = st.dataframe(to_df(rows, cols), width="stretch", hide_index=True, column_config=column_config,
+                             on_select="rerun", selection_mode="single-row", key=key)
+    with detail, st.container(border=True):
+        picked = event.selection.rows
+        if not picked or picked[0] >= len(rows):
+            st.caption("👈 Tam metni görmek için tablodan bir satıra tıklayın.")
+            return
+        it = rows[picked[0]]
+        info = [f"**{md_escape(str(it.get('author') or '?'))}**", f"👍 {it.get('likes', 0)}",
+                md_escape(str(it.get("date") or ""))]
+        if it.get("is_reply"):
+            info.append("↪️ yanıt")
+        if it.get("score") is not None:
+            info.append(f"⭐ {it['score']}/10")
+        st.markdown(" · ".join(x for x in info if x))
+        st.markdown(highlight(it.get("text"), query))
+        if it.get("reason"):
+            st.caption("Gerekçe")
+            st.markdown(highlight(it["reason"], query))
+        st.divider()
+        st.caption(md_escape(str(it.get("title") or "")))
+        if it.get("link"):
+            st.link_button("Kaynağında aç ↗", it["link"])
 
 
 def load_run_into_state(run_id):
@@ -215,24 +281,33 @@ for e in state.errors:
 link_cfg = {"link": st.column_config.LinkColumn("link", display_text="aç"),
             "text": st.column_config.TextColumn("metin", width="large")}
 
+query = ""
+if all_items:
+    query = st.text_input("🔍 Ara", placeholder="Metin, gerekçe, yazar veya başlıkta ara",
+                          key="search_query").strip()
+table_key = f"{state.run_id}_{fold(query)}"  # arama/kayıt değişince seçim sıfırlanır
+
 if state.results is not None:
-    st.subheader(f"✅ Seçilenler: {len(state.results)} / {len(all_items)}")
+    shown = [r for r in state.results if matches(r, query)] if query else state.results
+    st.subheader(f"✅ Seçilenler: {len(state.results)} / {len(all_items)}"
+                 + (f" · aramada {len(shown)}" if query else ""))
     cols = ["score", "text", "reason", "likes", "author", "date", "title", "link"]
-    df = to_df(state.results, cols)
-    st.dataframe(df, width="stretch", hide_index=True, column_config={
+    item_browser(shown, cols, {
         **link_cfg, "score": st.column_config.ProgressColumn("puan", min_value=0, max_value=10, format="%d"),
-        "reason": st.column_config.TextColumn("gerekçe", width="medium")})
+        "reason": st.column_config.TextColumn("gerekçe", width="medium")}, f"res_{table_key}", query)
+    df = to_df(state.results, cols)
     d1, d2 = st.columns(2)
     d1.download_button("CSV indir", df.to_csv(index=False).encode("utf-8-sig"), "secilenler.csv", "text/csv")
     d2.download_button("JSON indir", df.to_json(orient="records", force_ascii=False, indent=2),
                        "secilenler.json", "application/json")
 
 if all_items:
-    with st.expander(f"Tüm çekilen öğeler ({len(all_items)})"):
+    shown = [it for it in all_items if matches(it, query)] if query else all_items
+    label = f"Tüm çekilen öğeler ({len(all_items)}" + (f", aramada {len(shown)})" if query else ")")
+    with st.expander(label, expanded=state.results is None or bool(query)):
         cols = ["text", "likes", "author", "date", "is_reply", "title", "link"]
-        raw = to_df(all_items, cols)
-        st.dataframe(raw, width="stretch", hide_index=True, column_config=link_cfg)
-        st.download_button("Ham veriyi CSV indir", raw.to_csv(index=False).encode("utf-8-sig"),
+        item_browser(shown, cols, link_cfg, f"raw_{table_key}", query)
+        st.download_button("Ham veriyi CSV indir", to_df(all_items, cols).to_csv(index=False).encode("utf-8-sig"),
                            "tum_yorumlar.csv", "text/csv")
 
 # ---------------- Geçmiş (kenar çubuğunun sonuna, bu çalıştırmadaki kayıtlar dahil) ----------------
