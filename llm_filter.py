@@ -11,7 +11,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 MODELS = {
     "Claude Opus 5": "claude-opus-5",
@@ -32,10 +32,15 @@ PICK_TOKENS = 45               # seçilen öğe başına çıktı (index, puan, 
 SELECT_RATIO = (0.1, 0.5)      # seçilme oranı aralığı
 THINKING_TOKENS = (300, 3000)  # parti başına düşünme tokenı (Haiku 4.5'te düşünme kapalı)
 
+# Her prompt'un sonuna sabit eklenir (arayüzde görünür, kullanıcı tekrar yazmasın)
+TRANSLATE_SUFFIX = "seçtiğin yorumlardan türkçe olmayanları türkçeye çevir"
+
 SYSTEM = """Sen bir içerik ayıklama asistanısın. Kullanıcı sana bir YouTube videosunun yorumlarını \
 veya bir Ekşi Sözlük başlığının entry'lerini ve bir ayıklama kriteri verecek.
 Her öğe [numara] ile başlar. Kritere gerçekten uyan, işe yarar öğeleri seç; uymayanları dahil etme.
 Her seçilen öğe için: numarası, 1-10 arası uygunluk puanı ve kısa (tek cümle, Türkçe) seçilme gerekçesi ver.
+Kriter çeviri istiyorsa, Türkçe olmayan seçilmiş öğelerin tam Türkçe çevirisini translation alanına yaz; \
+Türkçe olanlar için translation boş string olsun.
 Hiçbiri uymuyorsa boş liste döndür."""
 
 
@@ -43,10 +48,39 @@ class Pick(BaseModel):
     index: int
     score: int
     reason: str
+    translation: str = Field(description="Öğe Türkçe değilse tam Türkçe çevirisi, Türkçeyse boş string")
 
 
 class Picks(BaseModel):
     selected: list[Pick]
+
+
+TRANSLATE_SYSTEM = """Sana [numara] ile başlayan yorumlar verilecek. Türkçe olmayan her yorumu (Hintçe, \
+Latin harfli Hintçe/Urduca, İngilizce vb.) anlamını koruyarak doğal Türkçeye çevir.
+Türkçe olan yorumları listeye ekleme. Hiçbiri çevrilecek değilse boş liste döndür."""
+
+
+class Translation(BaseModel):
+    index: int
+    translation: str
+
+
+class Translations(BaseModel):
+    translated: list[Translation]
+
+
+def strip_translate_suffix(criteria: str) -> str:
+    """Prompt'un sonundaki sabit çeviri ekini (varsa) çıkarır."""
+    text = (criteria or "").rstrip()
+    if text.lower().endswith(TRANSLATE_SUFFIX):
+        text = text[:-len(TRANSLATE_SUFFIX)].rstrip()
+    return text
+
+
+def with_translate_suffix(criteria: str) -> str:
+    """Kullanıcı prompt'u + sabit çeviri eki (ek zaten yazılmışsa ikinci kez eklenmez)."""
+    text = strip_translate_suffix(criteria)
+    return f"{text}\n\n{TRANSLATE_SUFFIX}" if text else TRANSLATE_SUFFIX
 
 
 def default_backend() -> str:
@@ -103,7 +137,7 @@ def estimate_cost(model: str, messages: list[str], n_items: int, input_tokens: i
             "output_tokens": (out_lo, out_hi), "cost": (cost(out_lo), cost(out_hi))}
 
 
-def _call_api(model: str, message: str) -> Picks:
+def _call_api(model: str, message: str, system: str = SYSTEM, schema: type[BaseModel] = Picks):
     client = anthropic.Anthropic()
     kwargs = {}
     if model == "claude-opus-5":
@@ -112,9 +146,9 @@ def _call_api(model: str, message: str) -> Picks:
     response = client.beta.messages.parse(
         model=model,
         max_tokens=16000,
-        system=SYSTEM,
+        system=system,
         messages=[{"role": "user", "content": message}],
-        output_format=Picks,
+        output_format=schema,
         **kwargs,
     )
     if response.stop_reason == "refusal":
@@ -124,14 +158,14 @@ def _call_api(model: str, message: str) -> Picks:
     return response.parsed_output
 
 
-def _call_cli(model: str, message: str) -> Picks:
+def _call_cli(model: str, message: str, system: str = SYSTEM, schema: type[BaseModel] = Picks):
     cmd = [
-        "claude", "-p", SYSTEM,
+        "claude", "-p", system,
         "--output-format", "json",
         "--model", model,
         "--tools", "",
         "--no-session-persistence",
-        "--json-schema", json.dumps(Picks.model_json_schema()),
+        "--json-schema", json.dumps(schema.model_json_schema()),
     ]
     # Proje CLAUDE.md'si bağlama karışmasın diye boş bir dizinde çalıştır
     with tempfile.TemporaryDirectory() as cwd:
@@ -141,7 +175,7 @@ def _call_cli(model: str, message: str) -> Picks:
     data = json.loads(proc.stdout)
     if data.get("is_error") or "structured_output" not in data:
         raise RuntimeError(f"claude CLI yapılandırılmış çıktı döndürmedi: {str(data.get('result'))[:500]}")
-    return Picks.model_validate(data["structured_output"])
+    return schema.model_validate(data["structured_output"])
 
 
 def filter_items(items: list[dict], criteria: str, model: str, backend: str,
@@ -157,7 +191,11 @@ def filter_items(items: list[dict], criteria: str, model: str, backend: str,
             try:
                 for p in fut.result().selected:
                     if 0 <= p.index < len(items):
-                        results.append({**items[p.index], "score": p.score, "reason": p.reason})
+                        picked = {**items[p.index], "score": p.score, "reason": p.reason}
+                        if p.translation.strip():  # Türkçe olmayan: yalnızca çevirisi tutulur
+                            picked["text"] = p.translation.strip()
+                        picked["translated"] = bool(p.translation.strip())
+                        results.append(picked)
             except Exception as e:  # bir partinin hatası diğerlerini durdurmasın
                 errors.append(f"Parti {futures[fut]}: {e}")
             done += 1
@@ -168,3 +206,37 @@ def filter_items(items: list[dict], criteria: str, model: str, backend: str,
     unique = {(r["source"], r["id"]): r for r in results}
     ranked = sorted(unique.values(), key=lambda r: (-r["score"], -r["likes"]))
     return ranked, errors
+
+
+def needs_translation_check(results: list[dict] | None) -> bool:
+    """Çeviri özelliğinden önce ayıklanmış (dil kontrolü yapılmamış) sonuçlar var mı."""
+    return bool(results) and any("translated" not in r for r in results)
+
+
+def translate_items(items: list[dict], model: str, backend: str, batch_size: int = 40, workers: int = 4,
+                    on_progress=None) -> tuple[list[dict], list[str]]:
+    """Önceden seçilmiş öğelerden Türkçe olmayanların metnini Türkçe çevirisiyle değiştirir.
+    (yeni öğe listesi, hatalar) döndürür; hatalı partideki öğeler kontrol edilmemiş kalır."""
+    call = _call_api if backend == "api" else _call_cli
+    out = [dict(it) for it in items]
+    batches = [(o, "<yorumlar>\n" + _format_batch(items[o:o + batch_size], o) + "\n</yorumlar>")
+               for o in range(0, len(items), batch_size)]
+    errors, done = [], 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(call, model, msg, TRANSLATE_SYSTEM, Translations): o for o, msg in batches}
+        for fut in as_completed(futures):
+            o = futures[fut]
+            try:
+                translations = {t.index: t.translation.strip() for t in fut.result().translated}
+                for i in range(o, min(o + batch_size, len(items))):
+                    if "translated" in out[i]:
+                        continue
+                    if translations.get(i):
+                        out[i]["text"] = translations[i]
+                    out[i]["translated"] = bool(translations.get(i))
+            except Exception as e:
+                errors.append(f"Çeviri partisi {o}: {e}")
+            done += 1
+            if on_progress:
+                on_progress(done, len(batches))
+    return out, errors

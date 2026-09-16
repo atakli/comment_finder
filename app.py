@@ -5,7 +5,9 @@ import pandas as pd
 import streamlit as st
 
 import history
-from llm_filter import MODELS, build_requests, count_input_tokens, default_backend, estimate_cost, filter_items
+from llm_filter import (MODELS, TRANSLATE_SUFFIX, build_requests, count_input_tokens, default_backend, estimate_cost,
+                        filter_items, needs_translation_check, strip_translate_suffix, translate_items,
+                        with_translate_suffix)
 from scrapers import fetch_comments, fetch_entries
 
 st.set_page_config(page_title="Yorum Ayıklayıcı", page_icon="🔎", layout="wide")
@@ -76,6 +78,8 @@ def item_browser(rows, cols, column_config, key, query):
                 md_escape(str(it.get("date") or ""))]
         if it.get("is_reply"):
             info.append("↪️ yanıt")
+        if it.get("translated"):
+            info.append("🌐 Türkçeye çevrildi")
         if it.get("score") is not None:
             info.append(f"⭐ {it['score']}/10")
         st.markdown(" · ".join(x for x in info if x))
@@ -96,7 +100,8 @@ def load_run_into_state(run_id):
     state.fetched, state.results, state.errors = data["fetched"], data["results"], data["errors"]
     state.run_id, state.run_filtered = run_id, data["results"] is not None
     state.run_source = meta["source"]
-    state.source, state.links_text, state.criteria = meta["source"], "\n".join(meta["links"]), meta["criteria"]
+    state.source, state.links_text = meta["source"], "\n".join(meta["links"])
+    state.criteria = strip_translate_suffix(meta["criteria"])  # sabit ek tekrar yazılmasın
     label = next((k for k, v in MODELS.items() if v == meta["model"]), None)
     if label:
         state.model_label = label
@@ -179,6 +184,11 @@ links_text = st.text_area("Linkler (her satıra bir tane)", placeholder=placehol
 criteria = st.text_area("Ayıklama prompt'u",
                         placeholder="Örn: Ürünü uzun süre kullanmış kişilerin somut deneyimleri ve "
                                     "yaşadıkları kronik sorunlar", height=90, key="criteria")
+st.caption(f"➕ Prompt'un sonuna sabit olarak eklenir (tekrar yazmanıza gerek yok): **{TRANSLATE_SUFFIX}**")
+if criteria.strip() and strip_translate_suffix(criteria) != criteria.rstrip():
+    st.caption("ℹ️ Prompt'a yazdığınız çeviri ifadesi zaten sabit ek olduğu için ikinci kez gönderilmeyecek.")
+# Claude'a giden ve geçmişe kaydedilen prompt: kullanıcı metni + sabit çeviri eki
+full_criteria = with_translate_suffix(criteria) if criteria.strip() else ""
 
 state = st.session_state
 state.setdefault("fetched", {})     # link -> öğeler
@@ -214,12 +224,12 @@ if fetch_clicked or both_clicked:
                     st.error(f"{link} çekilemedi: {e}")
         if state.fetched:
             state.run_id, state.run_filtered, state.run_source = history.new_run_id(), False, source
-            save_current_run(criteria, model, backend)
+            save_current_run(full_criteria, model, backend)
 
 # ---------------- Maliyet tahmini ----------------
 fetched_items = [(link, items) for link, items in state.fetched.items() if items]
 if fetched_items and criteria.strip():
-    requests = [msg for _, items in fetched_items for _, msg in build_requests(items, criteria, int(batch_size))]
+    requests = [msg for _, items in fetched_items for _, msg in build_requests(items, full_criteria, int(batch_size))]
     n_total = sum(len(items) for _, items in fetched_items)
     est_key = (model, criteria, int(batch_size), state.run_id)
     with st.expander("💰 Ayıklama öncesi maliyet tahmini", expanded=state.results is None):
@@ -255,7 +265,7 @@ if (filter_clicked or both_clicked) and state.fetched:
             def progress(done, total, n=n):
                 bar.progress((n + done / total) / len(sources),
                              text=f"Kaynak {n + 1}/{len(sources)} · parti {done}/{total}")
-            picked, errs = filter_items(items, criteria, model, backend,
+            picked, errs = filter_items(items, full_criteria, model, backend,
                                         int(batch_size), int(workers), progress)
             results += picked
             errors += [f"{link} → {e}" for e in errs]
@@ -265,7 +275,7 @@ if (filter_clicked or both_clicked) and state.fetched:
         if state.run_id is None or state.run_filtered:  # önceki sonucu ezme, yeni kayıt aç
             state.run_id = history.new_run_id()
         state.run_filtered = True
-        save_current_run(criteria, model, backend)
+        save_current_run(full_criteria, model, backend)
 elif filter_clicked:
     st.warning("Önce yorumları çekin.")
 
@@ -289,6 +299,22 @@ table_key = f"{state.run_id}_{fold(query)}"  # arama/kayıt değişince seçim s
 
 if state.results is not None:
     shown = [r for r in state.results if matches(r, query)] if query else state.results
+    if needs_translation_check(state.results):
+        t1, t2 = st.columns([3, 1], vertical_alignment="center")
+        t1.info("Bu kayıt çeviri özelliğinden önce ayıklanmış; seçilenlerde Türkçe olmayan yorumlar olabilir.", icon="🌐")
+        if t2.button("🌐 Türkçe olmayanları çevir", width="stretch"):
+            bar = st.progress(0.0, text="Claude çeviriyor...")
+            state.results, errs = translate_items(
+                state.results, model, backend, workers=int(workers),
+                on_progress=lambda d, t: bar.progress(d / t, text=f"Çeviri partisi {d}/{t}"))
+            bar.empty()
+            state.errors = [e for e in state.errors if not e.startswith("Çeviri partisi")] + errs
+            try:  # aynı kayda yaz, ayıklamanın prompt/model bilgisini koru
+                old = history.load_run(state.run_id)[0]
+                save_current_run(old["criteria"], old["model"], old["backend"])
+            except (OSError, TypeError):
+                st.warning("Kayıt bulunamadı; çeviri yalnızca bu oturumda geçerli.")
+            st.rerun()
     st.subheader(f"✅ Seçilenler: {len(state.results)} / {len(all_items)}"
                  + (f" · aramada {len(shown)}" if query else ""))
     cols = ["score", "text", "reason", "likes", "author", "date", "title", "link"]
