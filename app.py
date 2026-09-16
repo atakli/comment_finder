@@ -51,6 +51,16 @@ def save_current_run(criteria, model, backend):
         st.warning(f"Geçmişe kaydedilemedi: {e}")
 
 
+# Yeni oturum (başka cihaz/sekme): URL'deki ?run=<id> kaydını, yoksa en son kaydı yükle.
+# Kayıtlar sunucuda (data/runs/) olduğu için her cihaz aynı sonuçları görür.
+if "session_loaded" not in st.session_state:
+    st.session_state.session_loaded = True
+    run_ids = [r["id"] for r in history.list_runs()]
+    wanted = st.query_params.get("run")
+    if run_ids:
+        load_run_into_state(wanted if wanted in run_ids else run_ids[0])
+
+
 # ---------------- Kenar çubuğu ----------------
 with st.sidebar:
     source = st.radio("Kaynak", ["YouTube", "Ekşi Sözlük"], horizontal=True, key="source")
@@ -222,3 +232,9 @@ with st.sidebar:
         h1, h2 = st.columns(2)
         h1.button("Yükle", on_click=load_run_into_state, args=(selected_run,), width="stretch")
         h2.button("Sil", on_click=delete_run, args=(selected_run,), width="stretch")
+
+# Açık kaydı URL'de tut: yenileyince/linki başka cihazda açınca aynı kayıt gelir
+if state.run_id:
+    st.query_params["run"] = state.run_id
+else:
+    st.query_params.pop("run", None)
