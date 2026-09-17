@@ -1,0 +1,28 @@
+{
+ "id": "20260916-201713",
+ "saved_at": "2026-09-17 00:48",
+ "source": "YouTube",
+ "links": [
+  "https://www.youtube.com/watch?v=PB-LXVfVMuA&pp=ygUGbWlncmVu",
+  "https://www.youtube.com/watch?v=MFfoPBPlAhg&pp=ygUGbWlncmVu",
+  "https://www.youtube.com/watch?v=g0cFrF59484&pp=ygUGbWlncmVu",
+  "https://www.youtube.com/watch?v=OZtTAVtZ2qY&pp=ygUGbWlncmVu",
+  "https://www.youtube.com/watch?v=2G0-ky49-rI&pp=ygUGbWlncmVu",
+  "https://www.youtube.com/watch?v=5WeOYW0RHko&pp=ygUGbWlncmVu",
+  "https://www.youtube.com/watch?v=mHd3Q91zpHA&pp=ygUGbWlncmVu",
+  "https://www.youtube.com/watch?v=L6yx12501As&pp=ygUGbWlncmVu"
+ ],
+ "titles": [
+  "\"MİGREN ASLINDA MİGREN DEĞİLDİR\" Oytun Erbaş migreni tetikleyen faktörleri anlattı",
+  "Migraine का सबसे असरदार घरेलु उपचार | Get Rid Of Migraine (100% Practical Tips)",
+  "क्या होता है माइग्रेन का सरदर्द || What causes Migraine",
+  "Migren Rahatsızlığı İçin Kür - Diyanet TV",
+  "Migren Ağrıları ve Sebepleri | 3 Soruda Migren Testi",
+  "HASTANELİK OLDUM ! MİGREN KRİZİ !! Tuğba Eroğlu | Yağmur Eroğlu"
+ ],
+ "criteria": "migren ağrısına iyi gelen tedavilerden/yöntemlerden bahseden yorumları ayıkla",
+ "model": "claude-sonnet-5",
+ "backend": "cli",
+ "n_items": 3829,
+ "n_selected": 354
+}

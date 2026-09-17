@@ -2,6 +2,6 @@
 __pycache__/
 *.pyc
 .streamlit/secrets.toml
-data/
+data/trash
 .env
 .claude/
