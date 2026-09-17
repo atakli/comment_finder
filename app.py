@@ -88,6 +88,7 @@ def admin_login_dialog():
 def admin_logout():
     st.session_state.is_admin = False
     st.session_state.preview_visitor = False
+    st.query_params.pop("run", None)
     st.rerun()
 
 
@@ -515,6 +516,20 @@ def save_current_run(criteria, model, backend):
         st.warning(f"Geçmişe kaydedilemedi: {e}")
 
 
+def get_run_display_title(meta):
+    """Kayıt için kullanıcı dostu başlık üretir."""
+    criteria = (meta.get("criteria") or "").strip()
+    if criteria:
+        cleaned = strip_translate_suffix(criteria).strip()
+        first_line = (cleaned or criteria).splitlines()[0].strip()
+        if first_line:
+            return first_line[0].upper() + first_line[1:]
+    titles = meta.get("titles") or meta.get("links") or []
+    if titles and titles[0]:
+        return titles[0]
+    return "İnceleme / Çalışma"
+
+
 # ==============================================================================
 # ZİYARETÇİ / OKUYUCU GÖRÜNÜMÜ (Ayar yok, sadece seçilmiş sonuçları arama & okuma)
 # ==============================================================================
@@ -522,11 +537,10 @@ def render_visitor_view(preview_mode=False):
     if preview_mode:
         st.info("👁️ **Ziyaretçi Önizleme Modundasınız.** Dışarıdan bağlanan ziyaretçiler yalnızca bu arayüzü görür; hiçbir ayara veya API anahtarına erişemez. Yönetici moduna dönmek için sol kenar çubuğundaki önizleme anahtarını kapatabilirsiniz.")
 
-    st.title("🔎 Yorum Arşivi")
-    st.caption("YouTube ve Ekşi Sözlük'ten yapay zeka ile derlenmiş seçkin yorumlar ve deneyimler.")
-
     curated_runs = [r for r in history.list_runs() if r.get("n_selected") and r["n_selected"] > 0]
     if not curated_runs:
+        st.title("🔎 Yorum Arşivi")
+        st.caption("YouTube ve Ekşi Sözlük'ten yapay zeka ile derlenmiş seçkin yorumlar ve deneyimler.")
         st.info("Henüz seçilmiş yorum içeren yayınlanmış bir kayıt bulunmuyor.")
         st.divider()
         if not st.session_state.get("is_admin"):
@@ -534,31 +548,113 @@ def render_visitor_view(preview_mode=False):
                 admin_login_dialog()
         return
 
-    # Çoklu konu varsa konu seçici
-    run_options = {
-        r["id"]: f"📌 {(r.get('criteria') or (r.get('titles') or ['İnceleme'])[0])[:75]} "
-                 f"({r['n_selected']} seçilmiş · {r['source']})"
-        for r in curated_runs
-    }
+    run_options = {}
+    for r in curated_runs:
+        t = get_run_display_title(r)
+        short_t = t if len(t) <= 80 else t[:77] + "..."
+        run_options[r["id"]] = f"📌 {short_t} ({r['n_selected']} seçilmiş · {r.get('source', '')})"
+
     curated_ids = list(run_options)
     wanted = st.query_params.get("run")
-    default_idx = curated_ids.index(wanted) if wanted in curated_ids else 0
+    if wanted and wanted not in curated_ids:
+        st.warning("Belirtilen çalışma bulunamadı veya yayınlanmış yorum içermiyor.")
+        st.query_params.pop("run", None)
+        wanted = None
 
-    if len(curated_runs) > 1:
-        selected_run_id = st.selectbox("📖 İncelenen Konuyu Seçin", curated_ids, format_func=run_options.get,
-                                       index=default_idx, key="vis_topic_select")
-    else:
-        selected_run_id = curated_ids[0]
+    # URL'de doğrudan bir çalışma seçilmemişse Ana Sayfa (Liste) görünümünü göster
+    if not wanted:
+        st.title("🔎 Yorum Arşivi")
+        st.caption("YouTube ve Ekşi Sözlük'ten yapay zeka ile derlenmiş seçkin yorumlar ve deneyimler.")
 
+        st.markdown("### 📚 İncelenen Konular ve Çalışmalar")
+        st.write("Aşağıdaki listeden incelemek istediğiniz çalışmayı seçebilirsiniz:")
+
+        # Hızlı seçim kutusu (Dropdown)
+        selected_from_dropdown = st.selectbox(
+            "Çalışma Seçin",
+            curated_ids,
+            format_func=run_options.get,
+            index=None,
+            placeholder="🔍 Listeden bir çalışma seçin...",
+            key="vis_home_select",
+            label_visibility="collapsed"
+        )
+        if selected_from_dropdown:
+            st.query_params["run"] = selected_from_dropdown
+            st.rerun()
+
+        st.write("")
+
+        # Kartlar halinde çalışma listesi
+        for r in curated_runs:
+            with st.container(border=True):
+                c_info, c_btn = st.columns([4, 1], vertical_alignment="center")
+                with c_info:
+                    title = get_run_display_title(r)
+                    st.markdown(f"#### 📌 {title}")
+                    meta_info = [
+                        f"🏷️ **Kaynak:** {r.get('source', '')}",
+                        f"⭐ **{r['n_selected']} seçilmiş yorum**",
+                        f"📊 Toplam {r.get('n_items', r['n_selected']):,} yorum tarandı",
+                        f"🗓️ {r.get('saved_at', '')}"
+                    ]
+                    st.caption(" · ".join(meta_info))
+
+                    titles = r.get("titles") or r.get("links") or []
+                    if titles:
+                        with st.expander(f"📺 İncelenen Kaynaklar ({len(titles)})", expanded=False):
+                            for t in titles:
+                                st.write(f"- {t}")
+                with c_btn:
+                    if st.button("İncele ➔", key=f"btn_run_{r['id']}", type="primary", use_container_width=True):
+                        st.query_params["run"] = r["id"]
+                        st.rerun()
+
+        # Alt bilgi & Yönetici girişi
+        st.divider()
+        f1, f2 = st.columns([4, 1], vertical_alignment="center")
+        with f1:
+            st.caption("Yorum Ayıklayıcı · Ziyaretçi Okuma Modu")
+        with f2:
+            if not st.session_state.get("is_admin"):
+                if st.button("🔑 Yönetici Girişi", key="vis_home_footer_login"):
+                    admin_login_dialog()
+        return
+
+    # Tekil bir çalışma inceleniyorsa
+    selected_run_id = wanted
     st.query_params["run"] = selected_run_id
 
     try:
         meta, data = history.load_run(selected_run_id)
     except Exception as e:
         st.error(f"Kayıt yüklenemedi: {e}")
+        if st.button("⬅️ Listeye Dön", key="vis_err_back"):
+            st.query_params.pop("run", None)
+            st.rerun()
         return
 
     results = data.get("results") or []
+
+    # Üst gezinme çubuğu (Listeye dön & Diğer çalışmaya hızlı geçiş)
+    nav_c1, nav_c2 = st.columns([1, 2], vertical_alignment="center")
+    with nav_c1:
+        if st.button("⬅️ Tüm Çalışmalar", key="vis_top_back_btn", use_container_width=True):
+            st.query_params.pop("run", None)
+            st.rerun()
+    if len(curated_runs) > 1:
+        with nav_c2:
+            switch_to = st.selectbox(
+                "Diğer Çalışmaya Geç",
+                curated_ids,
+                index=curated_ids.index(selected_run_id),
+                format_func=run_options.get,
+                key="vis_switch_run_select",
+                label_visibility="collapsed"
+            )
+            if switch_to != selected_run_id:
+                st.query_params["run"] = switch_to
+                st.rerun()
 
     # Konu başlığı ve kaynaklar
     with st.container(border=True):
@@ -623,12 +719,16 @@ def render_visitor_view(preview_mode=False):
 
     # Alt bilgi & Yönetici girişi
     st.divider()
-    f1, f2 = st.columns([4, 1])
+    f1, f2, f3 = st.columns([1.5, 2.5, 1], vertical_alignment="center")
     with f1:
-        st.caption("Yorum Ayıklayıcı · Ziyaretçi Okuma Modu")
+        if st.button("⬅️ Tüm Çalışmalara Dön", key="vis_footer_back", use_container_width=True):
+            st.query_params.pop("run", None)
+            st.rerun()
     with f2:
+        st.caption("Yorum Ayıklayıcı · Ziyaretçi Okuma Modu")
+    with f3:
         if not st.session_state.get("is_admin"):
-            if st.button("🔑 Yönetici Girişi", key="vis_footer_login"):
+            if st.button("🔑 Yönetici Girişi", key="vis_footer_login", use_container_width=True):
                 admin_login_dialog()
 
 
