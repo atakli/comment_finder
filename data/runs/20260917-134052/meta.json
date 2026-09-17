@@ -1,0 +1,24 @@
+{
+ "id": "20260917-134052",
+ "saved_at": "2026-09-17 13:40",
+ "source": "YouTube",
+ "links": [
+  "https://youtu.be/f4vFFJg4Aik?si=9Xo7UWA5jkkabD5r",
+  "https://youtu.be/_ovN8YM2o2g?si=RLYZzZQ8Cx1RNRC-",
+  "https://youtu.be/aGzuObVt8EQ?si=1-4sA1xC2AIPkfyO",
+  "https://youtu.be/krBvYTfxJks?si=ju_-CbkvPWmyjg0V",
+  "https://youtu.be/QTIZjPIrYsY?si=1CrN2QAt6sC-xneP",
+  "https://youtu.be/NC6OQL7wStw?si=VDckOx4TU1Kkn7mu"
+ ],
+ "titles": [
+  "En iyi  Lipodem tedavisi nasıl yapılır? - Prof. Dr. Ahmet AKGUL",
+  "Eating to Starve Lymphedema & Lipedema - Chuck Ehrlich, MS, MBA - Patient Symposium 2019",
+  "Yağ Bezelerine Karşı Etkili Kür | Prof. İbrahim Saraçoğlu",
+  "Lymphatic Drainage Exercise for the Legs: An Exercise Routine for Lymphatic Flow and Lymphedema"
+ ],
+ "criteria": "lipödeme ve/veya varise iyi gelen tedavilerden/yöntemlerden bahseden yorumları ayıkla\n\nseçtiğin yorumlardan türkçe olmayanları türkçeye çevir",
+ "model": "models/gemini-3.1-flash-lite-preview",
+ "backend": "api",
+ "n_items": 1850,
+ "n_selected": 183
+}

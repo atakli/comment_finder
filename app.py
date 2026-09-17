@@ -470,6 +470,8 @@ def load_run_into_state(run_id):
     state.source, state.links_text = meta["source"], "\n".join(meta["links"])
     state.criteria = strip_translate_suffix(meta["criteria"])  # sabit ek tekrar yazılmasın
     label = next((k for k, v in MODELS.items() if v["id"] == meta["model"]), None)
+    if not label and meta.get("model") in ("gemini-3.1-flash-preview", "gemini-3.1-flash-lite-preview", "models/gemini-3.1-flash-lite-preview"):
+        label = "Gemini 3.1 Flash-Lite (Preview)"
     if label:
         state.model_label = label
 

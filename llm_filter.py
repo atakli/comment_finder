@@ -25,16 +25,22 @@ MODELS = {
     "Claude Opus 5": {"id": "claude-opus-5", "provider": "anthropic"},
     "Claude Sonnet 5": {"id": "claude-sonnet-5", "provider": "anthropic"},
     "Claude Haiku 4.5": {"id": "claude-haiku-4-5", "provider": "anthropic"},
-    "Gemini 3.1 Flash (Preview)": {"id": "gemini-3.1-flash-preview", "provider": "google"},
+    "Gemini 3.1 Flash-Lite (Preview)": {"id": "models/gemini-3.1-flash-lite-preview", "provider": "google"},
 }
 MODEL_PROVIDER = {v["id"]: v["provider"] for v in MODELS.values()}
+MODEL_PROVIDER.update({
+    "gemini-3.1-flash-lite-preview": "google",
+    "gemini-3.1-flash-preview": "google",
+})
 
 # (giriş, çıkış) $ / 1M token
 PRICES = {
     "claude-opus-5": (5.0, 25.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-haiku-4-5": (1.0, 5.0),
-    "gemini-3.1-flash-preview": (0.075, 0.30),  # tahmini; önizleme modeli, resmi fiyatı teyit edilmedi
+    "models/gemini-3.1-flash-lite-preview": (0.075, 0.30),  # tahmini; önizleme modeli, resmi fiyatı teyit edilmedi
+    "gemini-3.1-flash-lite-preview": (0.075, 0.30),
+    "gemini-3.1-flash-preview": (0.075, 0.30),
 }
 # Maliyet tahmini varsayımları
 CHARS_PER_TOKEN = 3.0          # Türkçe metinde kabaca; tam sayım için count_tokens kullanılır
@@ -44,7 +50,12 @@ GROUP_TOKENS = 10              # seçilen öğe başına ek çıktı: kısa grup
 PICK_TOKENS = BASE_PICK_TOKENS + GROUP_TOKENS
 SELECT_RATIO = (0.1, 0.5)      # seçilme oranı aralığı
 THINKING_TOKENS = (300, 3000)  # parti başına düşünme tokenı (Haiku 4.5 ve Gemini Flash'ta düşünme kapalı)
-NO_THINKING_MODELS = {"claude-haiku-4-5", "gemini-3.1-flash-preview"}
+NO_THINKING_MODELS = {
+    "claude-haiku-4-5",
+    "models/gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-preview",
+}
 
 # Her prompt'un sonuna sabit eklenir (arayüzde görünür, kullanıcı tekrar yazmasın)
 TRANSLATE_SUFFIX = "seçtiğin yorumlardan türkçe olmayanları türkçeye çevir"
