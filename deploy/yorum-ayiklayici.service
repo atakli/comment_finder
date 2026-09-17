@@ -1,0 +1,17 @@
+[Unit]
+Description=Yorum Ayıklayıcı (Streamlit)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/youtube_comment
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# İsteğe bağlı: ANTHROPIC_API_KEY=..., GEMINI_API_KEY=... (git'e girmez)
+EnvironmentFile=-%h/youtube_comment/.env
+ExecStart=%h/.local/bin/uv run streamlit run app.py --server.headless true --server.port 8501
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
