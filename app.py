@@ -140,6 +140,11 @@ def highlight(text, query):
     return "".join(parts).replace("\n", "  \n")
 
 
+def clear_search_query(key):
+    st.session_state[key] = ""
+
+
+
 def inject_keyboard_nav():
     """Masaüstünde Sağ/Sol ok tuşları ve mobilde yatay kaydırma ile gezinme betiği."""
     st.html("""
@@ -574,8 +579,15 @@ def render_visitor_view(preview_mode=False):
     has_groups = any(r.get("group") for r in results)
     s_col, g_col = st.columns([2, 1] if has_groups else [1, 0.01])
     with s_col:
-        query = st.text_input("🔍 Kelime ile ara", placeholder="Metin, grup, yazar veya başlıkta ara...",
-                              key=f"vis_query_{selected_run_id}").strip()
+        s_in, s_btn = st.columns([6, 1] if has_groups else [11, 1], vertical_alignment="bottom", gap="xsmall", wrap=False)
+        with s_in:
+            query = st.text_input("🔍 Kelime ile ara", placeholder="Metin, grup, yazar veya başlıkta ara...",
+                                  key=f"vis_query_{selected_run_id}", type="search").strip()
+        with s_btn:
+            st.button("", icon=":material/close:", key=f"vis_clear_{selected_run_id}",
+                      help="Aramayı sıfırla", disabled=not bool(query),
+                      on_click=clear_search_query, args=(f"vis_query_{selected_run_id}",),
+                      width="stretch")
 
     group_filter = "Tümü"
     groups = sorted({r["group"] for r in results if r.get("group")})
@@ -789,8 +801,15 @@ def render_admin_view():
 
     query = ""
     if all_items:
-        query = st.text_input("🔍 Ara", placeholder="Metin, grup, yazar veya başlıkta ara",
-                              key="search_query").strip()
+        s_in, s_btn = st.columns([11, 1], vertical_alignment="bottom", gap="xsmall", wrap=False)
+        with s_in:
+            query = st.text_input("🔍 Ara", placeholder="Metin, grup, yazar veya başlıkta ara",
+                                  key="search_query", type="search").strip()
+        with s_btn:
+            st.button("", icon=":material/close:", key="search_query_clear",
+                      help="Aramayı sıfırla", disabled=not bool(query),
+                      on_click=clear_search_query, args=("search_query",),
+                      width="stretch")
     table_key = f"{state.run_id}_{fold(query)}"
 
     if state.results is not None:
