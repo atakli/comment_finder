@@ -14,7 +14,7 @@ import history
 from llm_filter import (MODELS, PROVIDERS, TRANSLATE_SUFFIX, build_requests, count_input_tokens, default_backend,
                         estimate_cost, filter_items, get_model_thinking_config,
                         needs_translation_check, strip_translate_suffix,
-                        translate_items, with_translate_suffix)
+                        translate_items)
 from local_storage import (add_api_key, delete_api_key, get_all_keys,
                            get_default_key_id_for_model, get_key_by_id,
                            get_saved_api_key, mask_key, sanitize_model_key,
@@ -1160,13 +1160,13 @@ def render_admin_view():
     else:
         placeholder = "https://..."
     links_text = st.text_area("Linkler (her satıra bir tane)", placeholder=placeholder, height=110, key="links_text")
-    criteria = st.text_area("Ayıklama prompt'u",
-                            placeholder="Örn: Ürünü uzun süre kullanmış kişilerin somut deneyimleri ve "
-                                        "yaşadıkları kronik sorunlar", height=90, key="criteria")
-    st.caption(f"➕ Prompt'un sonuna sabit olarak eklenir (tekrar yazmanıza gerek yok): **{TRANSLATE_SUFFIX}**")
-    if criteria.strip() and strip_translate_suffix(criteria) != criteria.rstrip():
-        st.caption("ℹ️ Prompt'a yazdığınız çeviri ifadesi zaten sabit ek olduğu için ikinci kez gönderilmeyecek.")
-    full_criteria = with_translate_suffix(criteria) if criteria.strip() else ""
+    criteria = st.text_area(
+        "Ayıklama prompt'u",
+        placeholder=TRANSLATE_SUFFIX,
+        height=90,
+        key="criteria",
+    )
+    full_criteria = criteria.strip() if criteria else ""
 
     # ---------------- Önceden Çekilmiş / Süzülmüş Yorum Listeleri ----------------
     all_saved_runs = history.list_runs()
@@ -1633,7 +1633,7 @@ def render_admin_view():
                 except (OSError, TypeError):
                     st.warning("Kayıt bulunamadı; çeviri yalnızca bu oturumda geçerli.")
                 st.rerun()
-        active_c = state.get("active_criteria") or (with_translate_suffix(criteria) if criteria else "")
+        active_c = state.get("active_criteria") or (criteria.strip() if criteria else "")
         if active_c:
             st.caption(f"🎯 **Aktif ayıklama kriteri:** {strip_translate_suffix(active_c)}")
         st.subheader(f"✅ Seçilenler: {len(state.results)} / {len(all_items)}"

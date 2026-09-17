@@ -178,3 +178,23 @@ def test_app_thinking_ui():
     assert radios_gemini[0].value == "MEDIUM"
     assert "Düşük (Hızlı, daha az token)" in radios_gemini[0].options
     assert "Yüksek (Derin akıl yürütme)" in radios_gemini[0].options
+
+
+def test_criteria_placeholder_and_no_suffix():
+    from streamlit.testing.v1 import AppTest
+    from llm_filter import TRANSLATE_SUFFIX
+
+    app_path = str(Path(__file__).resolve().parent.parent / "app.py")
+    at = AppTest.from_file(app_path, default_timeout=30)
+    at.run()
+    at.query_params["admin"] = os.environ.get("ADMIN_PASSWORD", "admin")
+    at.run()
+
+    crit_area = at.text_area(key="criteria")
+    assert crit_area is not None
+    assert crit_area.placeholder == TRANSLATE_SUFFIX
+    assert crit_area.placeholder == "seçtiğin yorumlardan türkçe olmayanları türkçeye çevir"
+
+    crit_area.input("").run()
+    assert at.text_area(key="criteria").value == ""
+

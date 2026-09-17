@@ -1,0 +1,17 @@
+{
+ "id": "20260917-220308",
+ "saved_at": "2026-09-17 22:12",
+ "source": "Ekşi Sözlük",
+ "links": [
+  "https://eksisozluk.com/lipodem--6121927"
+ ],
+ "titles": [
+  "lipödem"
+ ],
+ "criteria": "lipödeme ve/veya varise iyi gelen tedavilerden/yöntemlerden bahseden yorumları seç, diğerlerini sil.",
+ "model": "models/gemini-3.1-flash-lite-preview",
+ "backend": "api",
+ "n_items": 32,
+ "n_selected": 13,
+ "thinking_level": "MINIMAL"
+}

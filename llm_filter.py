@@ -136,7 +136,7 @@ def get_model_thinking_config(model: str) -> dict | None:
     """Model düşünme parametresi kabul ediyorsa yapılandırmasını döner."""
     return MODEL_THINKING_CONFIG.get(model)
 
-# Her prompt'un sonuna sabit eklenir (arayüzde görünür, kullanıcı tekrar yazmasın)
+# Çeviri istendiğinde prompt'a eklenebilecek standart ifade (arayüzde placeholder olarak gösterilir)
 TRANSLATE_SUFFIX = "seçtiğin yorumlardan türkçe olmayanları türkçeye çevir"
 
 SYSTEM = """Sen bir içerik ayıklama asistanısın. Kullanıcı sana bir YouTube videosunun yorumlarını \
