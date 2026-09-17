@@ -1,4 +1,4 @@
-"""Web arayüzü: YouTube / Ekşi Sözlük'ten yorum çek, prompt'a göre LLM ile ayıkla.
+"""Web arayüzü: YouTube / Ekşi Sözlük / Instagram / Facebook'tan yorum çek, prompt'a göre LLM ile ayıkla.
 
 Ziyaretçiler için sadeleştirilmiş okuma/arama modu, yönetici için tam ayar ve ayıklama paneli.
 """
@@ -12,9 +12,17 @@ import streamlit as st
 
 import history
 from llm_filter import (MODELS, PROVIDERS, TRANSLATE_SUFFIX, build_requests, count_input_tokens, default_backend,
-                        estimate_cost, filter_items, needs_translation_check, strip_translate_suffix,
+                        estimate_cost, filter_items, get_model_thinking_config,
+                        needs_translation_check, strip_translate_suffix,
                         translate_items, with_translate_suffix)
-from scrapers import fetch_comments, fetch_entries
+from local_storage import (add_api_key, delete_api_key, get_all_keys,
+                           get_default_key_id_for_model, get_key_by_id,
+                           get_saved_api_key, mask_key, sanitize_model_key,
+                           save_api_key_for_model, set_default_key_for_model,
+                           sync_api_keys_storage)
+from scrapers import (fetch_comments, fetch_entries, fetch_facebook_comments,
+                      fetch_instagram_comments, get_facebook_cookies,
+                      get_instagram_cookies)
 
 st.set_page_config(page_title="Yorum Ayıklayıcı", page_icon="🔎", layout="wide")
 
@@ -102,6 +110,16 @@ def cached_eksi(url, max_pages, nice):
     return fetch_entries(url, max_pages, nice)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_instagram(url, max_comments, include_replies=True, sessionid=None, apify_token=None):
+    return fetch_instagram_comments(url, max_comments, include_replies, sessionid=sessionid, apify_token=apify_token)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_facebook(url, max_comments, cookies=None, access_token=None, apify_token=None):
+    return fetch_facebook_comments(url, max_comments, cookies=cookies, access_token=access_token, apify_token=apify_token)
+
+
 def to_df(rows, cols):
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
@@ -139,6 +157,22 @@ def highlight(text, query):
                 pos = m.end()
     parts.append(md_escape(text[pos:]))
     return "".join(parts).replace("\n", "  \n")
+
+
+SOURCE_ICONS = {
+    "youtube": "📺",
+    "eksi": "🟢",
+    "instagram": "📷",
+    "facebook": "📘",
+}
+
+
+def get_source_icon(source: str | None) -> str:
+    s = str(source or "").lower().replace(" ", "").replace("sözlük", "")
+    for k, v in SOURCE_ICONS.items():
+        if k in s:
+            return v
+    return "🔗"
 
 
 def clear_search_query(key):
@@ -323,7 +357,7 @@ def item_browser(rows, cols, column_config, key, query):
             st.divider()
             b1, b2 = st.columns([3, 1], vertical_alignment="center")
             with b1:
-                st.caption(f"📺 {md_escape(str(it.get('title') or ''))}")
+                st.caption(f"{get_source_icon(it.get('source'))} {md_escape(str(it.get('title') or ''))}")
             with b2:
                 if it.get("link"):
                     st.link_button("Kaynağında aç ↗", it["link"], use_container_width=True)
@@ -389,7 +423,7 @@ def item_browser(rows, cols, column_config, key, query):
                 st.divider()
                 c_t, c_b = st.columns([4, 1], vertical_alignment="center")
                 with c_t:
-                    st.caption(f"📺 {md_escape(str(it.get('title') or ''))}")
+                    st.caption(f"{get_source_icon(it.get('source'))} {md_escape(str(it.get('title') or ''))}")
                 with c_b:
                     if it.get("link"):
                         st.link_button("Aç ↗", it["link"], use_container_width=True)
@@ -456,7 +490,7 @@ def item_browser(rows, cols, column_config, key, query):
             st.divider()
             st.markdown(highlight(it.get("text"), query))
             st.divider()
-            st.caption(md_escape(str(it.get("title") or "")))
+            st.caption(f"{get_source_icon(it.get('source'))} {md_escape(str(it.get('title') or ''))}")
             if it.get("link"):
                 st.link_button("Kaynağında aç ↗", it["link"])
 
@@ -470,11 +504,16 @@ def load_run_into_state(run_id):
     state.run_source = meta["source"]
     state.source, state.links_text = meta["source"], "\n".join(meta["links"])
     state.criteria = strip_translate_suffix(meta["criteria"])  # sabit ek tekrar yazılmasın
+    state.active_criteria = meta.get("criteria", "")
     label = next((k for k, v in MODELS.items() if v["id"] == meta["model"]), None)
     if not label and meta.get("model") in ("gemini-3.1-flash-preview", "gemini-3.1-flash-lite-preview", "models/gemini-3.1-flash-lite-preview"):
         label = "Gemini 3.1 Flash-Lite (Preview)"
+    if not label and meta.get("model") in ("gemini-3.8-flash", "models/gemini-3.8-flash"):
+        label = "Gemini 3.8 Flash"
     if label:
         state.model_label = label
+    if meta.get("thinking_level") and meta.get("model"):
+        state[f"thinking_level_{sanitize_model_key(meta['model'])}"] = meta["thinking_level"]
 
 
 @st.dialog("Kaydı sil")
@@ -507,11 +546,12 @@ def undo_delete():
         state.undo_error = f"{last['label']} geri alınamadı (çöp kutusunda yok ya da aynı kayıt zaten var)."
 
 
-def save_current_run(criteria, model, backend):
+def save_current_run(criteria, model, backend, thinking_level=None):
     state = st.session_state
     try:
         history.save_run(state.run_id, source=state.run_source, criteria=criteria, model=model,
-                         backend=backend, fetched=state.fetched, results=state.results, errors=state.errors)
+                         backend=backend, fetched=state.fetched, results=state.results, errors=state.errors,
+                         thinking_level=thinking_level)
     except OSError as e:
         st.warning(f"Geçmişe kaydedilemedi: {e}")
 
@@ -540,7 +580,7 @@ def render_visitor_view(preview_mode=False):
     curated_runs = [r for r in history.list_runs() if r.get("n_selected") and r["n_selected"] > 0]
     if not curated_runs:
         st.title("🔎 Yorum Arşivi")
-        st.caption("YouTube ve Ekşi Sözlük'ten yapay zeka ile derlenmiş seçkin yorumlar ve deneyimler.")
+        st.caption("YouTube, Ekşi Sözlük, Instagram ve Facebook'tan yapay zeka ile derlenmiş seçkin yorumlar ve deneyimler.")
         st.info("Henüz seçilmiş yorum içeren yayınlanmış bir kayıt bulunmuyor.")
         st.divider()
         if not st.session_state.get("is_admin"):
@@ -564,7 +604,7 @@ def render_visitor_view(preview_mode=False):
     # URL'de doğrudan bir çalışma seçilmemişse Ana Sayfa (Liste) görünümünü göster
     if not wanted:
         st.title("🔎 Yorum Arşivi")
-        st.caption("YouTube ve Ekşi Sözlük'ten yapay zeka ile derlenmiş seçkin yorumlar ve deneyimler.")
+        st.caption("YouTube, Ekşi Sözlük, Instagram ve Facebook'tan yapay zeka ile derlenmiş seçkin yorumlar ve deneyimler.")
 
         st.markdown("### 📚 İncelenen Konular ve Çalışmalar")
         st.write("Aşağıdaki listeden incelemek istediğiniz çalışmayı seçebilirsiniz:")
@@ -669,7 +709,7 @@ def render_visitor_view(preview_mode=False):
 
         titles = meta.get("titles") or meta.get("links") or []
         if titles:
-            with st.expander(f"📺 İncelenen Kaynaklar ({len(titles)})"):
+            with st.expander(f"{get_source_icon(meta.get('source'))} İncelenen Kaynaklar ({len(titles)})"):
                 for t in titles:
                     st.write(f"- {t}")
 
@@ -744,6 +784,7 @@ def render_admin_view():
     state.setdefault("run_filtered", False)
     state.setdefault("exact_tokens", {})
     state.setdefault("deleted_runs", [])
+    sync_api_keys_storage()
 
     if "session_loaded" not in state:
         state.session_loaded = True
@@ -754,16 +795,90 @@ def render_admin_view():
 
     # ---------------- Kenar çubuğu ----------------
     with st.sidebar:
-        source = st.radio("Kaynak", ["YouTube", "Ekşi Sözlük"], horizontal=True, key="source")
+        source = st.radio("Kaynak", ["YouTube", "Ekşi Sözlük", "Instagram", "Facebook"], horizontal=True, key="source")
         state.setdefault("run_source", source)
 
         st.subheader("Çekme ayarları")
+        ig_sessionid = None
+        ig_apify_token = None
+        fb_cookies = None
+        fb_access_token = None
+        fb_apify_token = None
+
         if source == "YouTube":
             max_comments = st.number_input("Video başına en fazla yorum", 50, 20000, 1000, step=100)
             include_replies = st.checkbox("Yanıtları da dahil et", value=True)
-        else:
+        elif source == "Ekşi Sözlük":
             max_pages = st.number_input("Başlık başına en fazla sayfa (sayfa = 10 entry)", 1, 1000, 20)
             nice = st.checkbox("Şükela sıralaması (en çok favorilenenler önce)", value=True)
+        elif source == "Instagram":
+            max_comments = st.number_input("Gönderi başına en fazla yorum", 10, 5000, 200, step=50)
+            include_replies = st.checkbox("Yanıtları da dahil et", value=True)
+
+            auto_ig_cookies, auto_ig_browser = get_instagram_cookies()
+            if auto_ig_cookies:
+                st.success(f"🟢 **{auto_ig_browser.capitalize()}** tarayıcınızdaki Instagram oturumu otomatik kullanılacak (çerez sormaz).")
+            else:
+                st.info("ℹ️ Tarayıcınızda (Firefox, Chrome vb.) Instagram'a giriş yaptığınızda sistem çerezi otomatik algılar.")
+
+            with st.expander("⚙️ Manuel / Alternatif Ayarlar"):
+                ig_method = st.radio(
+                    "Yöntem",
+                    ["Tarayıcıdan Otomatik", "Manuel sessionid", "Apify API"],
+                    horizontal=True,
+                    key="ig_method",
+                )
+                if ig_method == "Manuel sessionid":
+                    ig_sessionid = st.text_input(
+                        "Instagram sessionid çerezi",
+                        value=os.environ.get("INSTAGRAM_SESSIONID", ""),
+                        type="password",
+                        key="ig_sessionid_input",
+                    ).strip() or None
+                elif ig_method == "Apify API":
+                    ig_apify_token = st.text_input(
+                        "Apify API Token",
+                        value=os.environ.get("APIFY_API_KEY", ""),
+                        type="password",
+                        key="ig_apify_input",
+                    ).strip() or None
+
+        elif source == "Facebook":
+            max_comments = st.number_input("Gönderi başına en fazla yorum", 10, 5000, 200, step=50)
+
+            auto_fb_cookies, auto_fb_browser = get_facebook_cookies()
+            if auto_fb_cookies:
+                st.success(f"🟢 **{auto_fb_browser.capitalize()}** tarayıcınızdaki Facebook oturumu otomatik kullanılacak (çerez sormaz).")
+            else:
+                st.info("ℹ️ Tarayıcınızda (Firefox, Chrome vb.) Facebook'a giriş yaptığınızda sistem oturumu otomatik algılar.")
+
+            with st.expander("⚙️ Manuel / Alternatif Ayarlar"):
+                fb_method = st.radio(
+                    "Yöntem",
+                    ["Tarayıcıdan Otomatik", "Apify API (Önerilen)", "Facebook Access Token (Graph API)", "Manuel Çerez"],
+                    key="fb_method",
+                )
+                if fb_method == "Apify API (Önerilen)":
+                    fb_apify_token = st.text_input(
+                        "Apify API Token",
+                        value=os.environ.get("APIFY_API_KEY", ""),
+                        type="password",
+                        key="fb_apify_input",
+                    ).strip() or None
+                elif fb_method == "Facebook Access Token (Graph API)":
+                    fb_access_token = st.text_input(
+                        "Facebook Access Token",
+                        value=os.environ.get("FACEBOOK_ACCESS_TOKEN", ""),
+                        type="password",
+                        key="fb_token_input",
+                    ).strip() or None
+                elif fb_method == "Manuel Çerez":
+                    fb_cookies = st.text_input(
+                        "Facebook Çerezleri",
+                        value=os.environ.get("FACEBOOK_COOKIES", ""),
+                        type="password",
+                        key="fb_cookies_input",
+                    ).strip() or None
 
         st.subheader("Ayıklama (LLM)")
         model_label = st.selectbox("Model", list(MODELS), key="model_label")
@@ -772,8 +887,11 @@ def render_admin_view():
 
         if provider == "anthropic":
             backends = {"cli": "Claude Code CLI (abonelik)", "api": "Anthropic API (ANTHROPIC_API_KEY)"}
+            saved_has_anthropic = bool(get_all_keys("anthropic") or os.environ.get("ANTHROPIC_API_KEY"))
+            def_backend = "api" if saved_has_anthropic else default_backend()
+            backend_idx = list(backends).index(state.get("anthropic_backend_choice", def_backend))
             backend = st.radio("Backend", list(backends), format_func=backends.get,
-                               index=list(backends).index(default_backend()))
+                               index=backend_idx, key="anthropic_backend_choice")
         else:
             backend = "api"
             st.caption(f"{PROVIDERS[provider]['label']} modeli doğrudan API ile çağrılır (CLI seçeneği yok).")
@@ -781,20 +899,266 @@ def render_admin_view():
         api_key = None
         if backend == "api":
             env_var = PROVIDERS[provider]["env"]
-            if not os.environ.get(env_var):
-                api_key = st.text_input(f"{PROVIDERS[provider]['label']} API anahtarı", type="password",
-                                        key=f"apikey_{provider}").strip() or None
-                if not api_key:
-                    st.caption(f"ℹ️ {env_var} tanımlı değil; ayıklamak için API anahtarını girip Enter'a basın.")
-        key_ready = backend != "api" or bool(api_key or os.environ.get(PROVIDERS[provider]["env"]))
+            env_val = os.environ.get(env_var)
+            safe_m = sanitize_model_key(model)
+            select_key = f"active_key_select_{safe_m}"
+
+            provider_keys = get_all_keys(provider)
+            default_key_id = get_default_key_id_for_model(model, provider)
+
+            # Seçenek listesi: kayıtlı anahtarlar + varsa ortam değişkeni
+            key_options = []
+            lbl_to_kid = {}
+            kid_to_lbl = {}
+
+            for k in provider_keys:
+                kid = k["id"]
+                lbl = f"🔑 {k['name']} ({mask_key(k['key'])})"
+                if lbl in key_options:
+                    lbl = f"🔑 {k['name']} ({mask_key(k['key'])}) #{kid[-4:]}"
+                key_options.append(lbl)
+                lbl_to_kid[lbl] = kid
+                kid_to_lbl[kid] = lbl
+
+            if env_val:
+                env_lbl = f"🌐 Ortam Değişkeni (.env: {mask_key(env_val)})"
+                key_options.append(env_lbl)
+                lbl_to_kid[env_lbl] = "__env__"
+                kid_to_lbl["__env__"] = env_lbl
+
+            if key_options:
+                curr_sel_id = state.get(select_key)
+                if curr_sel_id in kid_to_lbl:
+                    curr_sel_lbl = kid_to_lbl[curr_sel_id]
+                elif default_key_id in kid_to_lbl:
+                    curr_sel_lbl = kid_to_lbl[default_key_id]
+                elif provider_keys:
+                    curr_sel_lbl = kid_to_lbl[provider_keys[0]["id"]]
+                else:
+                    curr_sel_lbl = key_options[0]
+
+                widget_k = f"select_widget_{safe_m}"
+                sel_idx = key_options.index(curr_sel_lbl) if curr_sel_lbl in key_options else 0
+
+                def on_key_change(sm=safe_m):
+                    lbl = state.get(f"select_widget_{sm}")
+                    kid = lbl_to_kid.get(lbl)
+                    if kid:
+                        state[f"active_key_select_{sm}"] = kid
+
+                selected_label = st.selectbox(
+                    f"{PROVIDERS[provider]['label']} API Anahtarı",
+                    key_options,
+                    index=sel_idx,
+                    key=widget_k,
+                    on_change=on_key_change,
+                )
+                selected_key_id = lbl_to_kid.get(selected_label) or state.get(select_key) or default_key_id
+                if selected_key_id:
+                    state[select_key] = selected_key_id
+
+                is_curr_default = (selected_key_id == default_key_id)
+                col_info, col_btn = st.columns([3, 2], vertical_alignment="center")
+                with col_info:
+                    if is_curr_default:
+                        st.caption(f"⭐ **{model_label}** için varsayılan.")
+                    else:
+                        st.caption("⚪ Varsayılan değil.")
+                with col_btn:
+                    if not is_curr_default:
+                        if st.button("⭐ Varsayılan Yap", key=f"btn_set_def_{safe_m}",
+                                     help=f"Seçili anahtarı '{model_label}' için varsayılan yap"):
+                            set_default_key_for_model(model, selected_key_id)
+                            st.toast(f"⭐ '{selected_label}' {model_label} için varsayılan yapıldı!", icon="⭐")
+
+                if selected_key_id == "__env__":
+                    api_key = env_val
+                else:
+                    k_obj = get_key_by_id(selected_key_id)
+                    api_key = k_obj["key"] if k_obj else None
+            else:
+                st.warning(f"⚠️ {PROVIDERS[provider]['label']} için kayıtlı API anahtarı yok.")
+                with st.expander(f"➕ {PROVIDERS[provider]['label']} Anahtarı Ekle", expanded=True):
+                    q_name = st.text_input("Anahtar Adı / Etiketi",
+                                           placeholder=f"Örn: Kişisel {PROVIDERS[provider]['label']}",
+                                           key=f"q_name_{safe_m}")
+                    q_val = st.text_input("API Anahtarı", type="password", key=f"q_key_{safe_m}")
+                    if st.button("💾 Kaydet ve Bu Modelle Kullan", type="primary", key=f"q_save_{safe_m}", width="stretch"):
+                        if not q_name.strip():
+                            st.error("Lütfen bir anahtar adı girin.")
+                        elif not q_val.strip():
+                            st.error("Lütfen API anahtarını girin.")
+                        else:
+                            new_kid = add_api_key(
+                                name=q_name.strip(),
+                                key=q_val.strip(),
+                                provider=provider,
+                                default_for_models=[model],
+                            )
+                            state[select_key] = new_kid
+                            st.toast(f"✅ '{q_name.strip()}' kaydedildi ve varsayılan yapıldı!", icon="🔑")
+                            st.rerun()
+
+        key_ready = backend != "api" or bool(api_key)
+
+        # Düşünme parametresi (Örn. Gemini 3.8 Flash, Gemini 3.1 Flash-Lite)
+        thinking_cfg = get_model_thinking_config(model)
+        thinking_level = None
+        if thinking_cfg:
+            safe_m = sanitize_model_key(model)
+            th_levels = thinking_cfg["levels"]
+            th_labels = thinking_cfg["labels"]
+            th_def = thinking_cfg["default"]
+            th_widget_key = f"thinking_level_{safe_m}"
+            th_curr = state.get(th_widget_key, th_def)
+            if th_curr not in th_levels:
+                th_curr = th_def
+            th_idx = th_levels.index(th_curr)
+
+            if thinking_cfg.get("mandatory"):
+                st.markdown("**🧠 Düşünme Modu (Thinking)**")
+                st.caption("ℹ️ Bu modelde düşünme modu mecburi olarak açıktır; akıl yürütme seviyesini seçebilirsiniz:")
+            else:
+                st.markdown("**🧠 Düşünme Seviyesi (Thinking)**")
+                st.caption("Modelin akıl yürütme derinliğini belirleyin:")
+
+            thinking_level = st.radio(
+                "Düşünme Seviyesi",
+                th_levels,
+                format_func=lambda x: th_labels.get(x, x),
+                index=th_idx,
+                key=th_widget_key,
+                label_visibility="collapsed",
+            )
 
         batch_size = st.number_input("İstek başına yorum sayısı", 20, 500, 150, step=10)
         workers = st.number_input("Paralel istek", 1, 8, 4)
 
+        # ---------------- API Anahtarları Yönetimi ----------------
+        all_saved_keys = get_all_keys()
+        with st.expander(f"🔑 API Anahtarları ({len(all_saved_keys)} kayıtlı)", expanded=False):
+            st.caption("🔒 API anahtarları bu bilgisayarda kalıcı bir dosyada saklanır (`data/api_keys.json`), Git'e veya geçmişe eklenmez.")
+            tab_list, tab_defaults, tab_add = st.tabs(["📋 Liste", "🎯 Varsayılanlar", "➕ Yeni Ekle"])
+
+            with tab_list:
+                if all_saved_keys:
+                    for k in all_saved_keys:
+                        k_id = k["id"]
+                        k_name = k["name"]
+                        k_prov = k["provider"]
+                        k_mask = mask_key(k["key"])
+                        prov_lbl = PROVIDERS.get(k_prov, {}).get("label", k_prov)
+
+                        def_for = [
+                            m_lbl for m_lbl, m_info in MODELS.items()
+                            if get_default_key_id_for_model(m_info["id"]) == k_id
+                        ]
+
+                        c_text, c_del = st.columns([4, 1], vertical_alignment="center")
+                        with c_text:
+                            st.markdown(f"**{k_name}** `({prov_lbl})`")
+                            def_desc = f"⭐ Varsayılan: {', '.join(def_for)}" if def_for else "⚪ Varsayılan değil"
+                            st.caption(f"`{k_mask}` · {def_desc}")
+                        with c_del:
+                            if st.button("🗑️", key=f"btn_del_key_{k_id}", help=f"'{k_name}' anahtarını sil"):
+                                delete_api_key(k_id)
+                                st.toast(f"🗑️ '{k_name}' silindi.")
+                                st.rerun()
+                        st.divider()
+                else:
+                    st.info("Henüz kayıtlı API anahtarı yok. '➕ Yeni Ekle' sekmesinden ekleyebilirsiniz.")
+
+            with tab_defaults:
+                st.caption("Her model seçildiğinde otomatik seçilecek varsayılan anahtarı belirleyin:")
+                for m_lbl, m_info in MODELS.items():
+                    m_id = m_info["id"]
+                    m_prov = m_info["provider"]
+                    prov_keys = get_all_keys(m_prov)
+                    env_k = os.environ.get(PROVIDERS[m_prov]["env"])
+
+                    def_opts = ["— Varsayılan Yok —"]
+                    def_lbl_to_id = {"— Varsayılan Yok —": "none"}
+                    def_id_to_lbl = {"none": "— Varsayılan Yok —"}
+
+                    for pk in prov_keys:
+                        pk_lbl = f"🔑 {pk['name']} ({mask_key(pk['key'])})"
+                        if pk_lbl in def_opts:
+                            pk_lbl = f"🔑 {pk['name']} ({mask_key(pk['key'])}) #{pk['id'][-4:]}"
+                        def_opts.append(pk_lbl)
+                        def_lbl_to_id[pk_lbl] = pk["id"]
+                        def_id_to_lbl[pk["id"]] = pk_lbl
+
+                    if env_k:
+                        env_lbl = f"🌐 .env ({PROVIDERS[m_prov]['env']})"
+                        def_opts.append(env_lbl)
+                        def_lbl_to_id[env_lbl] = "__env__"
+                        def_id_to_lbl["__env__"] = env_lbl
+
+                    curr_def = get_default_key_id_for_model(m_id)
+                    curr_def_lbl = def_id_to_lbl.get(curr_def, "— Varsayılan Yok —")
+                    curr_idx = def_opts.index(curr_def_lbl) if curr_def_lbl in def_opts else 0
+
+                    def_change_key = f"model_def_setting_{sanitize_model_key(m_id)}"
+                    new_def_lbl = st.selectbox(
+                        f"🤖 {m_lbl}",
+                        def_opts,
+                        index=curr_idx,
+                        key=def_change_key,
+                    )
+                    new_def_id = def_lbl_to_id.get(new_def_lbl, "none")
+                    if new_def_id != (curr_def or "none"):
+                        set_default_key_for_model(m_id, None if new_def_id == "none" else new_def_id)
+                        if new_def_id != "none":
+                            state[f"active_key_select_{sanitize_model_key(m_id)}"] = new_def_id
+                        st.toast(f"⭐ {m_lbl} için varsayılan güncellendi!")
+                        st.rerun()
+
+            with tab_add:
+                st.markdown("##### ➕ Yeni Anahtar Kaydet")
+                add_name = st.text_input("Anahtar Adı / Etiketi",
+                                         placeholder="Örn: Kişisel Claude Hesabım, İş Gemini...",
+                                         key="tab_add_key_name")
+                add_prov = st.selectbox("Sağlayıcı", list(PROVIDERS),
+                                        format_func=lambda p: PROVIDERS[p]["label"],
+                                        index=0 if provider == "anthropic" else 1,
+                                        key="tab_add_key_prov")
+                add_val = st.text_input("API Anahtarı", type="password",
+                                        placeholder="sk-ant-... veya AIza...",
+                                        key="tab_add_key_val")
+
+                matching_models = [lbl for lbl, info in MODELS.items() if info["provider"] == add_prov]
+                def_defaults = [model_label] if model_label in matching_models else matching_models[:1]
+                add_def_models = st.multiselect("Varsayılan yapılacak modeller:", matching_models,
+                                                default=def_defaults, key="tab_add_key_def_models")
+
+                if st.button("💾 Anahtarı Kaydet", type="primary", key="tab_add_key_btn", width="stretch"):
+                    if not add_name.strip():
+                        st.error("Lütfen bir anahtar adı girin.")
+                    elif not add_val.strip():
+                        st.error("Lütfen geçerli bir API anahtarı girin.")
+                    else:
+                        target_model_ids = [MODELS[lbl]["id"] for lbl in add_def_models]
+                        new_kid = add_api_key(
+                            name=add_name.strip(),
+                            key=add_val.strip(),
+                            provider=add_prov,
+                            default_for_models=target_model_ids,
+                        )
+                        st.toast(f"✅ '{add_name.strip()}' başarıyla kaydedildi!", icon="🔑")
+                        st.rerun()
+
     # ---------------- Ana alan ----------------
     st.title("🔎 Yorum Ayıklayıcı (Yönetici)")
-    placeholder = ("https://www.youtube.com/watch?v=...\nhttps://youtu.be/..." if source == "YouTube"
-                   else "https://eksisozluk.com/baslik-adi--123456\nveya doğrudan başlık adı")
+    if source == "YouTube":
+        placeholder = "https://www.youtube.com/watch?v=...\nhttps://youtu.be/..."
+    elif source == "Ekşi Sözlük":
+        placeholder = "https://eksisozluk.com/baslik-adi--123456\nveya doğrudan başlık adı"
+    elif source == "Instagram":
+        placeholder = "https://www.instagram.com/p/...\nhttps://www.instagram.com/reel/..."
+    elif source == "Facebook":
+        placeholder = "https://www.facebook.com/.../posts/...\nhttps://www.facebook.com/watch/?v=..."
+    else:
+        placeholder = "https://..."
     links_text = st.text_area("Linkler (her satıra bir tane)", placeholder=placeholder, height=110, key="links_text")
     criteria = st.text_area("Ayıklama prompt'u",
                             placeholder="Örn: Ürünü uzun süre kullanmış kişilerin somut deneyimleri ve "
@@ -803,6 +1167,87 @@ def render_admin_view():
     if criteria.strip() and strip_translate_suffix(criteria) != criteria.rstrip():
         st.caption("ℹ️ Prompt'a yazdığınız çeviri ifadesi zaten sabit ek olduğu için ikinci kez gönderilmeyecek.")
     full_criteria = with_translate_suffix(criteria) if criteria.strip() else ""
+
+    # ---------------- Önceden Çekilmiş / Süzülmüş Yorum Listeleri ----------------
+    all_saved_runs = history.list_runs()
+    fetched_runs = [r for r in all_saved_runs if (r.get("n_items") or 0) > 0]
+    filtered_runs = [r for r in all_saved_runs if r.get("n_selected") is not None]
+
+    fetched_labels = {}
+    for r in fetched_runs:
+        t = (r.get("titles") or r.get("links") or ["?"])[0]
+        if len(t) > 40:
+            t = t[:37] + "..."
+        fetched_labels[r["id"]] = f"{r['saved_at']} · {r['source']} · {r['n_items']:,} yorum · {t}"
+
+    filtered_labels = {}
+    for r in filtered_runs:
+        t = (r.get("titles") or r.get("links") or ["?"])[0]
+        if len(t) > 35:
+            t = t[:32] + "..."
+        crit_snip = f" · \"{r.get('criteria', '')[:25]}...\"" if r.get("criteria") else ""
+        filtered_labels[r["id"]] = f"{r['saved_at']} · {r['source']} · {r['n_selected']:,} seçili ({r['n_items']:,} içinden) · {t}{crit_snip}"
+
+    fetched_ids = [None] + [r["id"] for r in fetched_runs]
+    filtered_ids = [None] + [r["id"] for r in filtered_runs]
+
+    if state.get("target_fetched_id") not in fetched_ids:
+        state["target_fetched_id"] = None
+    if state.get("target_filtered_id") not in filtered_ids:
+        state["target_filtered_id"] = None
+
+    c_drop1, c_drop2 = st.columns(2)
+    with c_drop1:
+        target_fetched_id = st.selectbox(
+            "📥 Önceden çekilmiş yorumlar (üzerine ekle)",
+            options=fetched_ids,
+            index=fetched_ids.index(state.get("target_fetched_id")),
+            format_func=lambda x: "➕ Yeni liste oluştur (ekleme yapma)" if x is None else fetched_labels.get(x, x),
+            key="target_fetched_id",
+            help="Bir kayıt seçerseniz, yeni çekilen yorumlar sıfırdan liste açmak yerine bu kaydın çekilmiş yorum listesine eklenir.",
+        )
+        if target_fetched_id:
+            sel_meta = next((r for r in fetched_runs if r["id"] == target_fetched_id), None)
+            if sel_meta:
+                c_info, c_btn = st.columns([3, 1], vertical_alignment="center")
+                with c_info:
+                    st.caption(f"📌 **Hedef:** {sel_meta['saved_at']} · {sel_meta['n_items']:,} yorum · {len(sel_meta.get('links', []))} link")
+                with c_btn:
+                    if state.get("run_id") != target_fetched_id:
+                        if st.button("👁️ Yükle", key="btn_load_target_fetched", help="Bu kaydın verilerini ekrana yükler", use_container_width=True):
+                            load_run_into_state(target_fetched_id)
+                            st.rerun()
+
+    with c_drop2:
+        target_filtered_id = st.selectbox(
+            "🎯 Önceden süzülmüş yorumlar (üzerine ekle)",
+            options=filtered_ids,
+            index=filtered_ids.index(state.get("target_filtered_id")),
+            format_func=lambda x: "➕ Yeni liste oluştur (ekleme yapma)" if x is None else filtered_labels.get(x, x),
+            key="target_filtered_id",
+            help="Bir kayıt seçerseniz, yeni ayıklanan sonuçlar bu kaydın seçilenler listesine eklenir.",
+        )
+        if target_filtered_id:
+            sel_f_meta = next((r for r in filtered_runs if r["id"] == target_filtered_id), None)
+            if sel_f_meta:
+                fc_info, fc_btn = st.columns([3, 1], vertical_alignment="center")
+                with fc_info:
+                    crit_prev = sel_f_meta.get("criteria", "")[:40]
+                    st.caption(f"📌 **Hedef:** {sel_f_meta['saved_at']} · {sel_f_meta['n_selected']:,} seçili" + (f" · *{crit_prev}...*" if crit_prev else ""))
+                with fc_btn:
+                    if state.get("run_id") != target_filtered_id:
+                        if st.button("👁️ Yükle", key="btn_load_target_filtered", help="Bu kaydın verilerini ekrana yükler", use_container_width=True):
+                            load_run_into_state(target_filtered_id)
+                            st.rerun()
+
+    only_new_filter = True
+    if target_filtered_id and state.get("last_fetched_new"):
+        only_new_filter = st.checkbox(
+            f"⚡ Yalnızca az önce yeni çekilen yorumları ({len(state.last_fetched_new)} yorum) ayıkla ve listeye ekle",
+            value=True,
+            help="İşaretliyse yalnızca az önce çekilen yeni yorumlar LLM'e gönderilir ve hedef süzülmüş listeye eklenir; eski yorumlar için tekrar token harcanmaz.",
+            key="only_new_filter_chk",
+        )
 
     c1, c2, c3 = st.columns(3)
     fetch_clicked = c1.button("1️⃣ Yorumları çek", width="stretch")
@@ -815,26 +1260,90 @@ def render_admin_view():
         if not links:
             st.warning("En az bir link girin.")
         else:
-            state.fetched, state.results, state.errors = {}, None, []
+            newly_fetched = {}
+            fetch_errors = []
             for link in links:
                 with st.spinner(f"Çekiliyor: {link}"):
                     try:
                         if source == "YouTube":
-                            state.fetched[link] = cached_youtube(link, int(max_comments), include_replies)
-                        else:
-                            state.fetched[link] = cached_eksi(link, int(max_pages), nice)
+                            newly_fetched[link] = cached_youtube(link, int(max_comments), include_replies)
+                        elif source == "Ekşi Sözlük":
+                            newly_fetched[link] = cached_eksi(link, int(max_pages), nice)
+                        elif source == "Instagram":
+                            newly_fetched[link] = cached_instagram(
+                                link,
+                                int(max_comments),
+                                include_replies=include_replies,
+                                sessionid=ig_sessionid,
+                                apify_token=ig_apify_token,
+                            )
+                        elif source == "Facebook":
+                            newly_fetched[link] = cached_facebook(
+                                link,
+                                int(max_comments),
+                                cookies=fb_cookies,
+                                access_token=fb_access_token,
+                                apify_token=fb_apify_token,
+                            )
                     except Exception as e:
+                        fetch_errors.append(f"{link} çekilemedi: {e}")
                         st.error(f"{link} çekilemedi: {e}")
-            if state.fetched:
-                state.run_id, state.run_filtered, state.run_source = history.new_run_id(), False, source
-                save_current_run(full_criteria, model, backend)
+
+            if newly_fetched:
+                new_items_count = sum(len(v) for v in newly_fetched.values())
+                all_new_items = [it for items in newly_fetched.values() for it in items]
+                state.last_fetched_new = all_new_items
+
+                if target_fetched_id:
+                    try:
+                        base_meta, base_data = history.load_run(target_fetched_id)
+                        base_fetched = base_data.get("fetched", {})
+                    except Exception as e:
+                        st.error(f"Hedef kayıt ({target_fetched_id}) yüklenemedi: {e}")
+                        base_meta, base_fetched = {}, {}
+                        base_data = {"results": None, "errors": []}
+
+                    merged_fetched, added_count = history.merge_fetched(base_fetched, newly_fetched)
+                    state.fetched = merged_fetched
+                    state.run_id = target_fetched_id
+                    state.run_filtered = (base_data.get("results") is not None)
+                    state.run_source = base_meta.get("source", source)
+                    state.results = base_data.get("results")
+                    state.errors = base_data.get("errors", []) + fetch_errors
+                    save_current_run(base_meta.get("criteria", full_criteria), model, backend)
+                    st.toast(
+                        f"✅ {added_count} yeni yorum '{target_fetched_id}' kaydına eklendi (toplam {sum(len(v) for v in merged_fetched.values())} yorum)!",
+                        icon="📥",
+                    )
+                else:
+                    state.fetched = newly_fetched
+                    state.results = None
+                    state.errors = fetch_errors
+                    state.run_id = history.new_run_id()
+                    state.run_filtered = False
+                    state.run_source = source
+                    save_current_run(full_criteria, model, backend)
+                    st.toast(f"✅ {new_items_count} yorum çekildi!", icon="📥")
 
     # ---------------- Maliyet tahmini ----------------
     fetched_items = [(link, items) for link, items in state.fetched.items() if items]
-    if fetched_items and criteria.strip():
-        requests = [msg for _, items in fetched_items for _, msg in build_requests(items, full_criteria, int(batch_size))]
-        n_total = sum(len(items) for _, items in fetched_items)
-        est_key = (model, criteria, int(batch_size), state.run_id)
+    if not fetched_items and (target_fetched_id or target_filtered_id):
+        t_id = target_fetched_id or target_filtered_id
+        try:
+            _, t_d = history.load_run(t_id)
+            fetched_items = [(link, items) for link, items in t_d.get("fetched", {}).items() if items]
+        except Exception:
+            pass
+
+    if target_filtered_id and state.get("last_fetched_new") and only_new_filter:
+        est_items = [("Yeni çekilenler", state["last_fetched_new"])]
+    else:
+        est_items = fetched_items
+
+    if est_items and criteria.strip():
+        requests = [msg for _, items in est_items for _, msg in build_requests(items, full_criteria, int(batch_size))]
+        n_total = sum(len(items) for _, items in est_items)
+        est_key = (model, criteria, int(batch_size), state.run_id, n_total, thinking_level)
         with st.expander("💰 Ayıklama öncesi maliyet tahmini", expanded=state.results is None):
             if backend == "api" and provider == "anthropic" and st.button("Token'ları API ile tam say (ücretsiz)"):
                 try:
@@ -842,7 +1351,7 @@ def render_admin_view():
                         state.exact_tokens = {est_key: count_input_tokens(model, requests, int(workers), api_key)}
                 except Exception as e:
                     st.error(f"Token sayılamadı: {e}")
-            est = estimate_cost(model, requests, n_total, state.exact_tokens.get(est_key))
+            est = estimate_cost(model, requests, n_total, state.exact_tokens.get(est_key), thinking_level=thinking_level)
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("İstek (parti)", est["batches"], help=f"{n_total} öğe, {est['chars']:,} karakter")
             m2.metric("Giriş token", f"{'' if est['exact'] else '~'}{est['input_tokens']:,}")
@@ -851,9 +1360,11 @@ def render_admin_view():
             st.caption("🏷️ Bunun içinde gruplama özelliğinin payı: ${:.3f}–${:.3f}".format(*est["group_cost"]))
             notes = ["Giriş tokenı " + ("token sayma API'siyle ölçüldü." if est["exact"]
                                         else "karakter sayısından yaklaşık hesaplandı (~3 karakter/token).")]
-            notes.append("Çıkış aralığı öğelerin %10–50'sinin seçileceği, seçilen her öğe için indeks/puan/grup "
-                         "adı üretileceği ve (Haiku/Gemini Flash dışında) parti başına 300–3000 düşünme tokenı "
-                         "varsayar.")
+            if thinking_cfg and thinking_level:
+                notes.append(f"Çıkış aralığı öğelerin %10–50'sinin seçileceği ve '{thinking_cfg['labels'].get(thinking_level, thinking_level)}' düşünme seviyesi varsayar.")
+            else:
+                notes.append("Çıkış aralığı öğelerin %10–50'sinin seçileceği, seçilen her öğe için indeks/puan/grup "
+                             "adı üretileceği ve (Haiku dışında) parti başına düşünme tokenı varsayar.")
             if backend == "cli":
                 notes.append("CLI backend'inde doğrudan ücret yok; bu tutar Claude aboneliğinin kullanım "
                              "kotasından düşer (CLI kendi sistem prompt'unu da ekler).")
@@ -862,32 +1373,80 @@ def render_admin_view():
                              "teyit edin.")
             st.caption(" ".join(notes))
 
-    if (filter_clicked or both_clicked) and state.fetched:
-        if not criteria.strip():
+    if (filter_clicked or both_clicked):
+        if not state.fetched:
+            target_load = target_fetched_id or target_filtered_id
+            if target_load:
+                try:
+                    t_meta, t_data = history.load_run(target_load)
+                    state.fetched = t_data.get("fetched", {})
+                    state.run_id = target_load
+                    state.run_source = t_meta.get("source", source)
+                except Exception as e:
+                    st.error(f"Seçili kayıt ({target_load}) yüklenemedi: {e}")
+
+        if not state.fetched:
+            st.warning("Önce yorumları çekin veya listeden bir kayıt seçin.")
+        elif not criteria.strip():
             st.warning("Ayıklama prompt'u girin.")
         elif not key_ready:
-            st.warning(f"{PROVIDERS[provider]['env']} tanımlı değil ve API anahtarı girilmedi.")
+            st.warning(f"{PROVIDERS[provider]['label']} için API anahtarı seçilmedi veya girilmedi.")
         else:
+            if target_filtered_id and state.get("last_fetched_new") and only_new_filter:
+                items_to_filter = state["last_fetched_new"]
+                sources = [("Yeni çekilenler", items_to_filter)]
+            else:
+                sources = [(link, items) for link, items in state.fetched.items() if items]
+
             results, errors = [], []
             bar = st.progress(0.0, text="Ayıklanıyor...")
-            sources = [(link, items) for link, items in state.fetched.items() if items]
             for n, (link, items) in enumerate(sources):
                 def progress(done, total, n=n):
                     bar.progress((n + done / total) / len(sources),
                                  text=f"Kaynak {n + 1}/{len(sources)} · parti {done}/{total}")
                 picked, errs = filter_items(items, full_criteria, model, backend,
-                                            int(batch_size), int(workers), progress, api_key)
+                                            int(batch_size), int(workers), progress, api_key,
+                                            thinking_level=thinking_level)
                 results += picked
                 errors += [f"{link} → {e}" for e in errs]
             bar.empty()
-            state.results = sorted(results, key=lambda r: (-r["score"], -r["likes"]))
-            state.errors = errors
-            if state.run_id is None or state.run_filtered:
-                state.run_id = history.new_run_id()
-            state.run_filtered = True
-            save_current_run(full_criteria, model, backend)
-    elif filter_clicked:
-        st.warning("Önce yorumları çekin.")
+
+            if target_filtered_id:
+                try:
+                    filt_meta, filt_data = history.load_run(target_filtered_id)
+                    base_results = filt_data.get("results") or []
+                    base_fetched = filt_data.get("fetched") or {}
+                except Exception as e:
+                    st.error(f"Hedef süzülmüş kayıt ({target_filtered_id}) yüklenemedi: {e}")
+                    filt_meta, base_results, base_fetched = {}, [], {}
+                    filt_data = {"errors": []}
+
+                combined_results, added_res_count = history.merge_results(base_results, results)
+                merged_fetched, _ = history.merge_fetched(base_fetched, state.fetched)
+
+                state.fetched = merged_fetched
+                state.results = combined_results
+                state.errors = filt_data.get("errors", []) + errors
+                state.run_id = target_filtered_id
+                state.run_filtered = True
+                save_criteria = filt_meta.get("criteria") or full_criteria
+                state.active_criteria = save_criteria
+                save_current_run(save_criteria, model, backend, thinking_level=thinking_level)
+                state.last_fetched_new = None
+                st.toast(
+                    f"✅ {added_res_count} yeni süzülen yorum '{target_filtered_id}' listesine eklendi (toplam {len(combined_results)} seçili)!",
+                    icon="🎯",
+                )
+            else:
+                state.results = sorted(results, key=lambda r: (-r["score"], -r["likes"]))
+                state.errors = errors
+                if state.run_id is None or state.run_filtered:
+                    state.run_id = history.new_run_id()
+                state.run_filtered = True
+                state.active_criteria = full_criteria
+                save_current_run(full_criteria, model, backend, thinking_level=thinking_level)
+                state.last_fetched_new = None
+                st.toast(f"✅ {len(results)} yorum ayıklandı!", icon="🎯")
 
     # ---------------- Sonuçlar ----------------
     all_items = [it for items in state.fetched.values() for it in items]
@@ -897,6 +1456,136 @@ def render_admin_view():
 
     for e in state.errors:
         st.error(e)
+
+    # ---------------- Tekrar Ayıklama (Admine Özel) ----------------
+    refilter_clicked = False
+    with st.expander("🔄 Farklı Prompt ile Tekrar Ayıkla (Admine Özel)", expanded=bool(state.fetched and state.results)):
+        st.markdown("##### 🎯 Yeni / İkincil Prompt ile Yeniden Ayıkla")
+        st.caption("Asıl ayıklama prompt'unuzu değiştirmeden, farklı bir kriter girerek mevcut verileri yeniden süzün.")
+
+        refilter_criteria = st.text_area(
+            "Tekrar ayıklama prompt'u (asıl prompttan ayrı)",
+            placeholder="Örn: Yalnızca garanti, servis veya kronik arıza deneyimi içeren yorumları filtrele...",
+            height=85,
+            key="refilter_criteria",
+        )
+
+        scope_choice = "all"
+        if state.results:
+            scope_choice = st.radio(
+                "Ayıklanacak veri:",
+                ["all", "selected"],
+                format_func={
+                    "all": f"Çekilen tüm yorumlar ({len(all_items)} yorum)",
+                    "selected": f"Mevcut seçilenler ({len(state.results)} yorum - sonuçları daralt)",
+                }.get,
+                horizontal=True,
+                key="refilter_scope",
+            )
+
+        replace_texts = st.checkbox(
+            "Üretilen metinleri öncekilerle değiştir (yeni çalıştırma oluşturma)",
+            value=False,
+            key="refilter_replace_texts",
+            help="Aktif edildiğinde yeni bir çalıştırma oluşturulmaz; LLM'in ürettiği metinler mevcut seçilenlerin üzerine yazılır.",
+        )
+
+        if refilter_criteria.strip() and all_items:
+            full_ref_crit = refilter_criteria.strip()
+            target_list = state.results if (scope_choice == "selected" and state.results) else all_items
+            ref_requests = [msg for _, msg in build_requests(target_list, full_ref_crit, int(batch_size))]
+            ref_est = estimate_cost(model, ref_requests, len(target_list), thinking_level=thinking_level)
+            st.caption(f"💰 Tahmini maliyet ({model_label}): **${ref_est['cost'][0]:.2f}–${ref_est['cost'][1]:.2f}** ({ref_est['batches']} istek, ~{ref_est['input_tokens']:,} token)")
+
+        ref_c1, ref_c2 = st.columns([3, 1], vertical_alignment="center")
+        with ref_c1:
+            th_note = f" · Düşünme: {thinking_cfg['labels'].get(thinking_level, thinking_level)}" if (thinking_cfg and thinking_level) else ""
+            st.caption(f"🤖 Model: **{model_label}**{th_note} · İstek başına {batch_size} yorum · {workers} paralel çalışan")
+        with ref_c2:
+            btn_label = "🔄 Metinleri Değiştir" if replace_texts else "🔄 Tekrar Ayıkla"
+            refilter_clicked = st.button(btn_label, type="primary", key="btn_refilter", width="stretch")
+
+    if refilter_clicked:
+        if not refilter_criteria.strip():
+            st.warning("Lütfen tekrar ayıklama için bir prompt girin.")
+        elif not state.fetched:
+            st.warning("Önce yorumları çekin veya geçmişten bir kayıt yükleyin.")
+        elif not key_ready:
+            st.warning(f"{PROVIDERS[provider]['label']} için API anahtarı seçilmedi veya girilmedi.")
+        else:
+            full_refilter_criteria = refilter_criteria.strip()
+            results, errors = [], []
+            bar = st.progress(0.0, text="Yeni prompt'a göre ayıklanıyor...")
+
+            if scope_choice == "selected" and state.results:
+                link_groups = {}
+                for r in state.results:
+                    link_groups.setdefault(r.get("link") or "seçilenler", []).append(r)
+                sources = list(link_groups.items())
+            else:
+                sources = [(link, items) for link, items in state.fetched.items() if items]
+
+            for n, (link, items) in enumerate(sources):
+                def progress(done, total, n=n):
+                    bar.progress((n + done / total) / len(sources),
+                                 text=f"Kaynak {n + 1}/{len(sources)} · parti {done}/{total}")
+                picked, errs = filter_items(items, full_refilter_criteria, model, backend,
+                                            int(batch_size), int(workers), progress, api_key,
+                                            thinking_level=thinking_level)
+                results += picked
+                errors += [f"{link} → {e}" for e in errs]
+            bar.empty()
+
+            if replace_texts:
+                new_by_key = {(r.get("source"), str(r.get("id"))): r for r in results}
+                updated_count = 0
+                if state.results is not None:
+                    for it in state.results:
+                        k = (it.get("source"), str(it.get("id")))
+                        if k in new_by_key:
+                            new_it = new_by_key[k]
+                            if new_it.get("text") and new_it["text"] != it.get("text"):
+                                it["text"] = new_it["text"]
+                                updated_count += 1
+                            if new_it.get("translated"):
+                                it["translated"] = True
+                else:
+                    state.results = sorted(results, key=lambda r: (-r["score"], -r["likes"]))
+                    updated_count = len(state.results)
+
+                if state.fetched:
+                    for link, items_list in state.fetched.items():
+                        for it in items_list:
+                            k = (it.get("source"), str(it.get("id")))
+                            if k in new_by_key:
+                                new_it = new_by_key[k]
+                                if new_it.get("text") and new_it["text"] != it.get("text"):
+                                    it["text"] = new_it["text"]
+                                if new_it.get("translated"):
+                                    it["translated"] = True
+
+                state.errors = errors
+                if state.run_id is None:
+                    state.run_id = history.new_run_id()
+                state.run_filtered = True
+                try:
+                    old_meta = history.load_run(state.run_id)[0]
+                    cur_criteria = old_meta.get("criteria")
+                except Exception:
+                    cur_criteria = None
+                save_criteria = cur_criteria or state.get("active_criteria") or full_refilter_criteria
+                save_current_run(save_criteria, model, backend, thinking_level=thinking_level)
+                st.toast(f"✅ {updated_count} yorumun metni değiştirildi (mevcut çalıştırma güncellendi)!", icon="🎯")
+                st.rerun()
+            else:
+                state.results = sorted(results, key=lambda r: (-r["score"], -r["likes"]))
+                state.errors = errors
+                state.run_id = history.new_run_id()
+                state.run_filtered = True
+                state.active_criteria = full_refilter_criteria
+                save_current_run(full_refilter_criteria, model, backend, thinking_level=thinking_level)
+                st.toast("✅ Yeni prompt'a göre tekrar ayıklama tamamlandı!", icon="🎯")
+                st.rerun()
 
     link_cfg = {"link": st.column_config.LinkColumn("link", display_text="aç"),
                 "text": st.column_config.TextColumn("metin", width="large")}
@@ -934,15 +1623,19 @@ def render_admin_view():
                 bar = st.progress(0.0, text="Çevriliyor...")
                 state.results, errs = translate_items(
                     state.results, model, backend, workers=int(workers), api_key=api_key,
+                    thinking_level=thinking_level,
                     on_progress=lambda d, t: bar.progress(d / t, text=f"Çeviri partisi {d}/{t}"))
                 bar.empty()
                 state.errors = [e for e in state.errors if not e.startswith("Çeviri partisi")] + errs
                 try:
                     old = history.load_run(state.run_id)[0]
-                    save_current_run(old["criteria"], old["model"], old["backend"])
+                    save_current_run(old["criteria"], old["model"], old["backend"], thinking_level=old.get("thinking_level"))
                 except (OSError, TypeError):
                     st.warning("Kayıt bulunamadı; çeviri yalnızca bu oturumda geçerli.")
                 st.rerun()
+        active_c = state.get("active_criteria") or (with_translate_suffix(criteria) if criteria else "")
+        if active_c:
+            st.caption(f"🎯 **Aktif ayıklama kriteri:** {strip_translate_suffix(active_c)}")
         st.subheader(f"✅ Seçilenler: {len(state.results)} / {len(all_items)}"
                      + (f" · süzülen {len(shown)}" if len(shown) != len(state.results) else ""))
         cols = ["score", "group", "text", "likes", "author", "date", "title", "link"]

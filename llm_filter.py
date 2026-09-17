@@ -25,12 +25,15 @@ MODELS = {
     "Claude Opus 5": {"id": "claude-opus-5", "provider": "anthropic"},
     "Claude Sonnet 5": {"id": "claude-sonnet-5", "provider": "anthropic"},
     "Claude Haiku 4.5": {"id": "claude-haiku-4-5", "provider": "anthropic"},
+    "Gemini 3.8 Flash": {"id": "gemini-3.8-flash", "provider": "google"},
     "Gemini 3.1 Flash-Lite (Preview)": {"id": "models/gemini-3.1-flash-lite-preview", "provider": "google"},
 }
 MODEL_PROVIDER = {v["id"]: v["provider"] for v in MODELS.values()}
 MODEL_PROVIDER.update({
     "gemini-3.1-flash-lite-preview": "google",
     "gemini-3.1-flash-preview": "google",
+    "gemini-3.8-flash": "google",
+    "models/gemini-3.8-flash": "google",
 })
 
 # (giriş, çıkış) $ / 1M token
@@ -38,6 +41,8 @@ PRICES = {
     "claude-opus-5": (5.0, 25.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-haiku-4-5": (1.0, 5.0),
+    "gemini-3.8-flash": (0.75, 3.75),
+    "models/gemini-3.8-flash": (0.75, 3.75),
     "models/gemini-3.1-flash-lite-preview": (0.075, 0.30),  # tahmini; önizleme modeli, resmi fiyatı teyit edilmedi
     "gemini-3.1-flash-lite-preview": (0.075, 0.30),
     "gemini-3.1-flash-preview": (0.075, 0.30),
@@ -49,13 +54,87 @@ BASE_PICK_TOKENS = 12          # seçilen öğe başına çıktı: indeks + puan
 GROUP_TOKENS = 10              # seçilen öğe başına ek çıktı: kısa grup adı (gruplama özelliğinin maliyeti)
 PICK_TOKENS = BASE_PICK_TOKENS + GROUP_TOKENS
 SELECT_RATIO = (0.1, 0.5)      # seçilme oranı aralığı
-THINKING_TOKENS = (300, 3000)  # parti başına düşünme tokenı (Haiku 4.5 ve Gemini Flash'ta düşünme kapalı)
+THINKING_TOKENS = (300, 3000)  # parti başına düşünme tokenı (Haiku 4.5'ta düşünme kapalı)
 NO_THINKING_MODELS = {
     "claude-haiku-4-5",
-    "models/gemini-3.1-flash-lite-preview",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-3.1-flash-preview",
 }
+
+# Modellerin düşünme (thinking / reasoning) parametresi yapılandırması
+MODEL_THINKING_CONFIG = {
+    "gemini-3.8-flash": {
+        "type": "level",
+        "mandatory": True,  # Düşünme modu zorunlu (kapatılamaz), ancak seviyesi seçilebilir
+        "levels": ["LOW", "MEDIUM", "HIGH"],
+        "default": "MEDIUM",
+        "labels": {
+            "LOW": "Düşük (Hızlı, daha az token)",
+            "MEDIUM": "Orta (Dengeli - Varsayılan)",
+            "HIGH": "Yüksek (Derin akıl yürütme)",
+        },
+        "token_ranges": {
+            "LOW": (150, 1000),
+            "MEDIUM": (300, 3000),
+            "HIGH": (1000, 6000),
+        },
+    },
+    "models/gemini-3.8-flash": {
+        "type": "level",
+        "mandatory": True,
+        "levels": ["LOW", "MEDIUM", "HIGH"],
+        "default": "MEDIUM",
+        "labels": {
+            "LOW": "Düşük (Hızlı, daha az token)",
+            "MEDIUM": "Orta (Dengeli - Varsayılan)",
+            "HIGH": "Yüksek (Derin akıl yürütme)",
+        },
+        "token_ranges": {
+            "LOW": (150, 1000),
+            "MEDIUM": (300, 3000),
+            "HIGH": (1000, 6000),
+        },
+    },
+    "models/gemini-3.1-flash-lite-preview": {
+        "type": "level",
+        "mandatory": False,
+        "levels": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
+        "default": "MINIMAL",
+        "labels": {
+            "MINIMAL": "Minimal (En hızlı, varsayılan)",
+            "LOW": "Düşük",
+            "MEDIUM": "Orta",
+            "HIGH": "Yüksek (Derin akıl yürütme)",
+        },
+        "token_ranges": {
+            "MINIMAL": (0, 200),
+            "LOW": (150, 1000),
+            "MEDIUM": (300, 3000),
+            "HIGH": (1000, 6000),
+        },
+    },
+    "gemini-3.1-flash-lite-preview": {
+        "type": "level",
+        "mandatory": False,
+        "levels": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
+        "default": "MINIMAL",
+        "labels": {
+            "MINIMAL": "Minimal (En hızlı, varsayılan)",
+            "LOW": "Düşük",
+            "MEDIUM": "Orta",
+            "HIGH": "Yüksek (Derin akıl yürütme)",
+        },
+        "token_ranges": {
+            "MINIMAL": (0, 200),
+            "LOW": (150, 1000),
+            "MEDIUM": (300, 3000),
+            "HIGH": (1000, 6000),
+        },
+    },
+}
+
+
+def get_model_thinking_config(model: str) -> dict | None:
+    """Model düşünme parametresi kabul ediyorsa yapılandırmasını döner."""
+    return MODEL_THINKING_CONFIG.get(model)
 
 # Her prompt'un sonuna sabit eklenir (arayüzde görünür, kullanıcı tekrar yazmasın)
 TRANSLATE_SUFFIX = "seçtiğin yorumlardan türkçe olmayanları türkçeye çevir"
@@ -150,14 +229,23 @@ def count_input_tokens(model: str, messages: list[str], workers: int = 4, api_ke
         return sum(pool.map(count, messages)) + SCHEMA_OVERHEAD * len(messages)
 
 
-def estimate_cost(model: str, messages: list[str], n_items: int, input_tokens: int | None = None) -> dict:
+def estimate_cost(model: str, messages: list[str], n_items: int, input_tokens: int | None = None,
+                  thinking_level: str | None = None) -> dict:
     """Ayıklamadan önce kabaca maliyet tahmini. input_tokens verilmezse karakterden hesaplanır."""
     n_batches = len(messages)
     chars = sum(len(m) for m in messages) + len(SYSTEM) * n_batches
     exact = input_tokens is not None
     if not exact:
         input_tokens = round(chars / CHARS_PER_TOKEN) + SCHEMA_OVERHEAD * n_batches
-    thinking = (0, 0) if model in NO_THINKING_MODELS else THINKING_TOKENS
+    th_cfg = get_model_thinking_config(model)
+    if th_cfg:
+        lvl = (thinking_level or th_cfg["default"]).upper()
+        token_ranges = th_cfg.get("token_ranges", {})
+        thinking = token_ranges.get(lvl, THINKING_TOKENS)
+    elif model in NO_THINKING_MODELS:
+        thinking = (0, 0)
+    else:
+        thinking = THINKING_TOKENS
     out_lo = round(n_items * SELECT_RATIO[0] * PICK_TOKENS) + thinking[0] * n_batches
     out_hi = round(n_items * SELECT_RATIO[1] * PICK_TOKENS) + thinking[1] * n_batches
     price_in, price_out = PRICES[model]
@@ -171,7 +259,7 @@ def estimate_cost(model: str, messages: list[str], n_items: int, input_tokens: i
 
 
 def _call_api(model: str, message: str, system: str = SYSTEM, schema: type[BaseModel] = Picks,
-              api_key: str | None = None):
+              api_key: str | None = None, thinking_level: str | None = None):
     client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
     kwargs = {}
     if model == "claude-opus-5":
@@ -193,7 +281,7 @@ def _call_api(model: str, message: str, system: str = SYSTEM, schema: type[BaseM
 
 
 def _call_cli(model: str, message: str, system: str = SYSTEM, schema: type[BaseModel] = Picks,
-              api_key: str | None = None):
+              api_key: str | None = None, thinking_level: str | None = None):
     cmd = [
         "claude", "-p", system,
         "--output-format", "json",
@@ -214,19 +302,30 @@ def _call_cli(model: str, message: str, system: str = SYSTEM, schema: type[BaseM
 
 
 def _call_gemini(model: str, message: str, system: str = SYSTEM, schema: type[BaseModel] = Picks,
-                 api_key: str | None = None):
+                 api_key: str | None = None, thinking_level: str | None = None):
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+    config_kwargs = {
+        "system_instruction": system,
+        "response_mime_type": "application/json",
+        "response_schema": schema,
+    }
+
+    # Model düşünme parametresi kabul ediyorsa thinking_config ekle
+    th_cfg = get_model_thinking_config(model)
+    eff_level = thinking_level or (th_cfg["default"] if th_cfg else None)
+    if eff_level:
+        try:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=eff_level.upper())
+        except Exception:
+            pass
+
     response = client.models.generate_content(
         model=model,
         contents=message,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            response_mime_type="application/json",
-            response_schema=schema,
-        ),
+        config=types.GenerateContentConfig(**config_kwargs),
     )
     if response.parsed is None:
         raise RuntimeError(f"Gemini yapılandırılmış çıktı döndürmedi: {str(response.text)[:500]}")
@@ -240,14 +339,15 @@ def _dispatch(model: str, backend: str):
 
 
 def filter_items(items: list[dict], criteria: str, model: str, backend: str, batch_size: int = 150,
-                 workers: int = 4, on_progress=None, api_key: str | None = None) -> tuple[list[dict], list[str]]:
+                 workers: int = 4, on_progress=None, api_key: str | None = None,
+                 thinking_level: str | None = None) -> tuple[list[dict], list[str]]:
     """(seçilenler, hatalar) döndürür. Seçilenlere score/group eklenir, puana göre sıralanır."""
     call = _dispatch(model, backend)
     batches = build_requests(items, criteria, batch_size)
     results, errors, done = [], [], 0
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(call, model, msg, SYSTEM, Picks, api_key): o for o, msg in batches}
+        futures = {pool.submit(call, model, msg, SYSTEM, Picks, api_key, thinking_level): o for o, msg in batches}
         for fut in as_completed(futures):
             try:
                 for p in fut.result().selected:
@@ -275,7 +375,8 @@ def needs_translation_check(results: list[dict] | None) -> bool:
 
 
 def translate_items(items: list[dict], model: str, backend: str, batch_size: int = 40, workers: int = 4,
-                    on_progress=None, api_key: str | None = None) -> tuple[list[dict], list[str]]:
+                    on_progress=None, api_key: str | None = None,
+                    thinking_level: str | None = None) -> tuple[list[dict], list[str]]:
     """Önceden seçilmiş öğelerden Türkçe olmayanların metnini Türkçe çevirisiyle değiştirir.
     (yeni öğe listesi, hatalar) döndürür; hatalı partideki öğeler kontrol edilmemiş kalır."""
     call = _dispatch(model, backend)
@@ -284,7 +385,7 @@ def translate_items(items: list[dict], model: str, backend: str, batch_size: int
                for o in range(0, len(items), batch_size)]
     errors, done = [], 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(call, model, msg, TRANSLATE_SYSTEM, Translations, api_key): o for o, msg in batches}
+        futures = {pool.submit(call, model, msg, TRANSLATE_SYSTEM, Translations, api_key, thinking_level): o for o, msg in batches}
         for fut in as_completed(futures):
             o = futures[fut]
             try:

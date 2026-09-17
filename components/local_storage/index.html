@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>LocalStorage Sync</title>
+</head>
+<body style="margin:0;padding:0;overflow:hidden;height:0;display:none;">
+<script>
+(function() {
+  let isInitialized = false;
+  let lastSavedHash = null;
+
+  function getStorage() {
+    try {
+      if (window.localStorage) return window.localStorage;
+    } catch (e) {}
+    try {
+      if (window.parent && window.parent.localStorage) return window.parent.localStorage;
+    } catch (e) {}
+    return null;
+  }
+
+  function setHeight(height) {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setFrameHeight",
+      height: height
+    }, "*");
+  }
+
+  function setValue(val) {
+    lastSavedHash = JSON.stringify(val);
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setComponentValue",
+      value: val
+    }, "*");
+  }
+
+  window.addEventListener("message", function(event) {
+    if (!event.data || event.data.type !== "streamlit:render") return;
+
+    setHeight(0);
+
+    const args = event.data.args || {};
+    const storageKey = args.storage_key || "llm_api_keys";
+    const storage = getStorage();
+
+    // 1. Save data if requested from Python
+    if (storage && args.save_keys !== undefined && args.save_keys !== null) {
+      try {
+        const jsonStr = JSON.stringify(args.save_keys);
+        if (jsonStr !== lastSavedHash) {
+          storage.setItem(storageKey, jsonStr);
+          lastSavedHash = jsonStr;
+        }
+      } catch (err) {
+        console.warn("LocalStorage save error:", err);
+      }
+    }
+
+    // 2. Clear storage if explicitly requested
+    if (storage && args.clear_all === true) {
+      try {
+        storage.removeItem(storageKey);
+        lastSavedHash = null;
+      } catch (err) {
+        console.warn("LocalStorage clear error:", err);
+      }
+    }
+
+    // 3. Initial load from LocalStorage on mount
+    if (!isInitialized) {
+      isInitialized = true;
+      let loaded = {};
+      if (storage) {
+        try {
+          const raw = storage.getItem(storageKey);
+          if (raw) {
+            loaded = JSON.parse(raw);
+          }
+        } catch (err) {
+          console.warn("LocalStorage read error:", err);
+        }
+      }
+      setValue(loaded);
+    }
+  });
+
+  // Signal component is ready to Streamlit parent
+  window.parent.postMessage({
+    isStreamlitMessage: true,
+    type: "streamlit:componentReady",
+    apiVersion: 1
+  }, "*");
+})();
+</script>
+</body>
+</html>

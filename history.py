@@ -30,7 +30,8 @@ def _write_json(path: Path, obj) -> None:
 
 
 def save_run(run_id: str, *, source: str, criteria: str, model: str, backend: str,
-             fetched: dict, results: list | None, errors: list[str]) -> None:
+             fetched: dict, results: list | None, errors: list[str],
+             thinking_level: str | None = None) -> None:
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     meta = {
@@ -45,6 +46,8 @@ def save_run(run_id: str, *, source: str, criteria: str, model: str, backend: st
         "n_items": sum(len(items) for items in fetched.values()),
         "n_selected": None if results is None else len(results),
     }
+    if thinking_level:
+        meta["thinking_level"] = thinking_level
     _write_json(run_dir / "data.json", {"fetched": fetched, "results": results, "errors": errors})
     _write_json(run_dir / "meta.json", meta)
 
@@ -87,3 +90,61 @@ def restore_run(run_id: str) -> bool:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     src.replace(dst)
     return True
+
+
+def merge_fetched(base_fetched: dict, new_fetched: dict) -> tuple[dict, int]:
+    """İki fetched dict'ini birleştirir ve öğeleri (id veya yazar+metin) tekilleştirir.
+
+    Döner:
+        (birlesmis_fetched, yeni_eklenen_oge_sayisi)
+    """
+    merged = {k: list(v) for k, v in (base_fetched or {}).items()}
+    total_added = 0
+    for link, new_items in (new_fetched or {}).items():
+        if link in merged:
+            existing_keys = {
+                (it.get("source"), str(it.get("id"))) if it.get("id") is not None
+                else (it.get("source"), str(it.get("author")), str(it.get("text")))
+                for it in merged[link]
+            }
+            items_to_add = [
+                it for it in new_items
+                if ((it.get("source"), str(it.get("id"))) if it.get("id") is not None
+                    else (it.get("source"), str(it.get("author")), str(it.get("text")))) not in existing_keys
+            ]
+            merged[link] = merged[link] + items_to_add
+            total_added += len(items_to_add)
+        else:
+            merged[link] = list(new_items)
+            total_added += len(new_items)
+    return merged, total_added
+
+
+def merge_results(base_results: list | None, new_results: list | None) -> tuple[list, int]:
+    """İki süzülmüş sonuç listesini birleştirir, tekilleştirir ve puana göre sıralar.
+
+    Döner:
+        (birlesmis_results, yeni_eklenen_sonuc_sayisi)
+    """
+    base = list(base_results or [])
+    new = list(new_results or [])
+    if not base:
+        sorted_new = sorted(new, key=lambda r: (-r.get("score", 0), -r.get("likes", 0)))
+        return sorted_new, len(new)
+    if not new:
+        return base, 0
+
+    existing_keys = {
+        (r.get("source"), str(r.get("id"))) if r.get("id") is not None
+        else (r.get("source"), str(r.get("author")), str(r.get("text")))
+        for r in base
+    }
+    items_to_add = [
+        r for r in new
+        if ((r.get("source"), str(r.get("id"))) if r.get("id") is not None
+            else (r.get("source"), str(r.get("author")), str(r.get("text")))) not in existing_keys
+    ]
+    combined = base + items_to_add
+    sorted_combined = sorted(combined, key=lambda r: (-r.get("score", 0), -r.get("likes", 0)))
+    return sorted_combined, len(items_to_add)
+

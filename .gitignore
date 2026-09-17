@@ -6,3 +6,9 @@ data/trash
 .env
 .claude/
 CLAUDE.md
+
+# API anahtarları dosyaları (güvenlik için git'e eklenmez)
+data/api_keys.json
+.api_keys.json
+api_keys.json
+*.tmp
